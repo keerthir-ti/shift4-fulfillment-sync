@@ -60,7 +60,7 @@ logs: ## Follow output. For one service: make logs SERVICE=oracle
 	$(COMPOSE) --profile sync logs -f $(SERVICE)
 
 health: ## Check that the app and simulators respond
-	@curl -sf http://127.0.0.1:$(WEB_PORT)/api/health && echo || (echo "Not responding on port $(WEB_PORT). Run make problem or make solution first."; exit 1)
+	@curl -sf http://127.0.0.1:$(WEB_PORT)/api/health && echo || (echo "Not healthy on port $(WEB_PORT). Check make status, or run make problem or make solution."; exit 1)
 
 reset: ## Clear all orders and start the scenario again
 	@curl -sf -X POST http://127.0.0.1:$(CONNECTOR_PORT)/lab/reset && echo || (echo "Not running. Run make problem or make solution first."; exit 1)
