@@ -1,0 +1,10 @@
+{
+  "name": "@shift4/sim",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "dependencies": {
+    "@shift4/contracts": "workspace:*",
+    "fastify": "5.2.1"
+  }
+}
