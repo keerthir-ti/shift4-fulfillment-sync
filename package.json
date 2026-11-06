@@ -1,0 +1,29 @@
+{
+  "name": "shift4-fulfillment-sync",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@9.15.9",
+  "scripts": {
+    "dev": "tsx scripts/dev.ts",
+    "demo": "tsx scripts/demo.ts",
+    "measure:gap": "tsx scripts/measure-gap.ts",
+    "worker": "tsx apps/worker/src/main.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p apps/web/tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:e2e": "playwright test",
+    "check:boundaries": "tsx scripts/check-boundaries.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.49.1",
+    "@temporalio/testing": "1.25.0",
+    "@temporalio/worker": "1.25.0",
+    "@types/node": "22.10.5",
+    "@types/react": "19.0.2",
+    "@types/react-dom": "19.0.2",
+    "tsx": "4.19.2",
+    "typescript": "5.6.3",
+    "vitest": "2.1.8"
+  }
+}
