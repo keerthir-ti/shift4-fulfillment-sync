@@ -49,6 +49,8 @@ async function measureSnapshotPath(profile: Profile, existingShipments: number, 
   try {
     process.env.ORACLE_URL = stack.oracle.url;
     process.env.FOUNDRY_URL = stack.foundry.url;
+    // Startup's first load models data already in place, so it doesn't count toward the connector's rate.
+    stack.oracle.ctx.requests.length = 0;
     await stack.clock.advanceTo(offsetMs);
     const orderNumber = await flowOrder({});
     const limit = offsetMs + 3 * profile.shipmentSnapshotIntervalMs + 60 * 60_000;

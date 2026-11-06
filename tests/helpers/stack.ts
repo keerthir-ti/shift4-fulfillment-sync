@@ -27,7 +27,7 @@ async function buildStack<C extends Clock>(clock: C, options?: StackOptions) {
   const reference = loadReference(join(process.cwd(), "fixtures/oracle-baseline-scenario.json"), options?.scenarioPaths ?? []);
   const scenarioId = `scenario-${Math.random().toString(16).slice(2)}`;
   const oracle = await startOracle({ scenarioId, profile, reference, clock, dataDir: join(dir, "oracle") });
-  if (options?.existingShipments) oracle.ctx.store.seedExistingShipments(options.existingShipments, clock.now());
+  if (options?.existingShipments) oracle.ctx.store.seedExistingShipments(options.existingShipments, clock.now() - 1);
   const foundry = await startFoundry({ scenarioId, profile, clock, dataDir: join(dir, "foundry") });
   const connector = await startConnector({
     scenarioId,
