@@ -1,14 +1,19 @@
 import { Context } from "@temporalio/activity";
 import { ApplicationFailure } from "@temporalio/common";
-import { coverage, shipmentContent, type OracleShipment } from "@shift4/contracts";
-import { SystemHttpError, type DeliveryEventSink, type FoundryFulfillmentStore, type OracleOrderReader, type OracleOrderView, type RecoveryIndex } from "./system-adapters";
-import type { CoverageResult, OrderLine, OrderReference, ReconcileResult, RecoveryResult, RowDifferences } from "./types";
+import { coverage, fulfillmentOrderContent, fulfillmentOrders, shipmentContent, type FulfillmentOrderView, type OracleShipment } from "@shift4/contracts";
+import { SystemHttpError, type DeliveryEventSink, type FoundryFulfillmentStore, type FulfillmentData, type OracleOrderReader, type OracleOrderView, type RecoveryIndex } from "./system-adapters";
+import type { AuditResult, CoverageResult, OrderLine, OrderReference, ReconcileResult, RecoveryResult, RowDifferences } from "./types";
 
 export type ActivityDeps = {
   oracle: OracleOrderReader;
   foundry: FoundryFulfillmentStore;
   /** Leave out to turn the recovery sweep off. */
-  recovery?: { index: RecoveryIndex; start(orderKey: string): Promise<"started" | "running" | "stopped" | "capped"> };
+  recovery?: {
+    index: RecoveryIndex;
+    start(orderKey: string): Promise<"started" | "running" | "stopped" | "capped">;
+    /** Runs a delivered order through reconcile again, at low priority. */
+    recheck(orderKey: string): Promise<"rechecking" | "running">;
+  };
   events?: DeliveryEventSink;
 };
 
@@ -72,7 +77,7 @@ export function compareRows(oracleRows: OracleShipment[], foundryRows: OracleShi
   const held = new Map(foundryRows.map((row) => [row.ShipmentLine, row]));
   const oracleIds = new Set(oracleRows.map((row) => row.ShipmentLine));
   const toWrite: OracleShipment[] = [];
-  const differences: RowDifferences = { missing: 0, older: 0, changed: 0, extra: 0 };
+  const differences: RowDifferences = { missing: 0, older: 0, changed: 0, extra: 0, orders: 0 };
   for (const row of oracleRows) {
     const current = held.get(row.ShipmentLine);
     if (!current) {
@@ -90,6 +95,31 @@ export function compareRows(oracleRows: OracleShipment[], foundryRows: OracleShi
   const toRemove = oracleRows.length === 0 ? [] : foundryRows.filter((row) => !oracleIds.has(row.ShipmentLine)).map((row) => row.ShipmentLine);
   differences.extra = toRemove.length;
   return { toWrite, toRemove, differences, inSync: toWrite.length === 0 && toRemove.length === 0 };
+}
+
+/**
+ * What must change for Foundry to match Oracle, including the fulfillment orders the warehouse sees.
+ * Those are worked out from the newest version of each line, so a newer Foundry row isn't undone.
+ */
+export function compareDelivery(oracleRows: OracleShipment[], held: FulfillmentData) {
+  const lines = compareRows(oracleRows, held.lines);
+  const heldLines = new Map(held.lines.map((row) => [row.ShipmentLine, row]));
+  const newest = oracleRows.map((row) => {
+    const current = heldLines.get(row.ShipmentLine);
+    return current && current.LastUpdateDate > row.LastUpdateDate ? current : row;
+  });
+  const expected = fulfillmentOrders(newest as unknown as Record<string, unknown>[]);
+  const keyOf = (order: { orderNumber: string; warehouse: string }) => `${order.orderNumber}|${order.warehouse}`;
+  const heldOrders = new Map(held.orders.map((order) => [keyOf(order), order]));
+  const expectedKeys = new Set(expected.map(keyOf));
+  const ordersToWrite: FulfillmentOrderView[] = expected.filter((order) => {
+    const current = heldOrders.get(keyOf(order));
+    return !current || fulfillmentOrderContent(current) !== fulfillmentOrderContent(order);
+  });
+  // As with lines, an empty Oracle answer never removes anything.
+  const ordersToRemove = oracleRows.length === 0 ? [] : held.orders.filter((order) => !expectedKeys.has(keyOf(order))).map(({ orderNumber, warehouse }) => ({ orderNumber, warehouse }));
+  const differences = { ...lines.differences, orders: ordersToWrite.length + ordersToRemove.length };
+  return { ...lines, differences, ordersToWrite, ordersToRemove, inSync: lines.inSync && ordersToWrite.length === 0 && ordersToRemove.length === 0 };
 }
 
 const coverageMessage = (state: { found: number; expected: number }) => `found quantity ${state.found} of ${state.expected}`;
@@ -126,14 +156,14 @@ export function createActivities(deps: ActivityDeps) {
       const fresh = await guarded(() => deps.oracle.findOrder(order.orderKey));
       const lines = fresh ? activeLines(fresh) : order.lines;
       const canceled = fresh !== null && lines.length === 0;
-      const [oracleRows, foundryRows] = await guarded(() => Promise.all([deps.oracle.listShipmentLines(order.orderNumber), deps.foundry.readShipmentLines(order.orderNumber)]));
+      const [oracleRows, held] = await guarded(() => Promise.all([deps.oracle.listShipmentLines(order.orderNumber), deps.foundry.readFulfillment(order.orderNumber)]));
       if (!canceled) {
         const state = shipmentCoverage(lines, oracleRows);
         if (!state.covered) throw notYet("ShipmentCoverageIncomplete", coverageMessage(state));
       }
-      const { toWrite, toRemove, differences, inSync } = compareRows(oracleRows, foundryRows);
-      if (toWrite.length > 0) await guarded(() => deps.foundry.writeShipmentLines(toWrite));
-      if (toRemove.length > 0) await guarded(() => deps.foundry.removeShipmentLines(toRemove));
+      const { toWrite, toRemove, ordersToWrite, ordersToRemove, differences, inSync } = compareDelivery(oracleRows, held);
+      if (toWrite.length > 0 || ordersToWrite.length > 0) await guarded(() => deps.foundry.writeFulfillment({ lines: toWrite, orders: ordersToWrite }));
+      if (toRemove.length > 0 || ordersToRemove.length > 0) await guarded(() => deps.foundry.removeFulfillment({ lines: toRemove, orders: ordersToRemove }));
       if (canceled) return { outcome: "canceled", lines: oracleRows.length, differences };
       return { outcome: inSync ? "in-sync" : "wrote", lines: oracleRows.length, differences };
     },
@@ -154,6 +184,16 @@ export function createActivities(deps: ActivityDeps) {
       const settled = await Promise.allSettled(keys.map((key) => recovery.start(key)));
       const count = (outcome: string) => settled.filter((entry) => entry.status === "fulfilled" && entry.value === outcome).length;
       return { checked: keys.length, started: count("started"), running: count("running"), stopped: count("stopped"), capped: count("capped"), failed: settled.filter((entry) => entry.status === "rejected").length };
+    },
+
+    /** Rechecks recently delivered orders, which finds drift no single run can see. */
+    async auditDeliveredOrders({ lookbackMs, limit }: { lookbackMs: number; limit: number }): Promise<AuditResult> {
+      const { recovery } = deps;
+      if (!recovery) throw ApplicationFailure.nonRetryable("This worker has no recovery sweep configured", "RecoveryNotConfigured");
+      const keys = await guarded(() => recovery.index.listDeliveredOrders({ since: Date.now() - lookbackMs, limit }));
+      const settled = await Promise.allSettled(keys.map((key) => recovery.recheck(key)));
+      const count = (outcome: string) => settled.filter((entry) => entry.status === "fulfilled" && entry.value === outcome).length;
+      return { checked: keys.length, rechecking: count("rechecking"), running: count("running"), failed: settled.filter((entry) => entry.status === "rejected").length };
     },
   };
 }

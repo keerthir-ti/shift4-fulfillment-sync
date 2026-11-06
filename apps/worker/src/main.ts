@@ -13,6 +13,7 @@ import {
   createLogEventSink,
   createRecoveryStarter,
   deliverySettingsFromEnv,
+  ensureAuditSchedule,
   ensureRecoverySchedule,
 } from "@shift4/order-delivery";
 import { createDeliveryWorkers } from "@shift4/order-delivery/worker";
@@ -26,6 +27,7 @@ const tls = apiKey ? true : undefined;
 const settings = deliverySettingsFromEnv(env);
 const oracleTaskQueue = settings.oracleTaskQueue ?? "oracle-reads";
 const sweepEveryMs = Number(env.SYNC_SWEEP_EVERY_MS ?? 15 * 60_000);
+const auditEveryMs = Number(env.SYNC_AUDIT_EVERY_MS ?? 24 * 60 * 60_000);
 const foundryAccess = { baseUrl: env.FOUNDRY_URL ?? "http://127.0.0.1:4020", authorization: env.FOUNDRY_AUTHORIZATION };
 
 // Prometheus metrics, including schedule-to-start latency, which rises when workers fall behind.
@@ -59,6 +61,14 @@ if (sweepEveryMs > 0) {
     taskQueue,
     everyMs: sweepEveryMs,
     input: { lookbackMs: Number(env.SYNC_SWEEP_LOOKBACK_MS ?? 24 * 60 * 60_000), limit: Number(env.SYNC_SWEEP_LIMIT ?? 100), settings },
+  });
+}
+
+if (recovery && auditEveryMs > 0) {
+  await ensureAuditSchedule(client, {
+    taskQueue,
+    everyMs: auditEveryMs,
+    input: { lookbackMs: Number(env.SYNC_AUDIT_LOOKBACK_MS ?? 3 * 24 * 60 * 60_000), limit: Number(env.SYNC_AUDIT_LIMIT ?? 100), settings },
   });
 }
 

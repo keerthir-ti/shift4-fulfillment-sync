@@ -4,6 +4,11 @@ import type { DeliveryResult, DeliverySettings, OrderDeliveryInput, RecoveryInpu
 
 export const workflowIdFor = (orderKey: string) => `order-delivery:${orderKey}`;
 export const RECOVERY_SCHEDULE_ID = "order-delivery-recovery";
+export const AUDIT_SCHEDULE_ID = "order-delivery-audit";
+
+/** Lower numbers run first, and Temporal's default is 3. New orders keep the default, so background work can't delay them. */
+const RECOVERY_PRIORITY = 4;
+const AUDIT_PRIORITY = 5;
 
 /** The short timeout means an unreachable Temporal can't stall an approval. */
 export async function connectTemporal(options: { address?: string; namespace?: string; apiKey?: string; connectTimeoutMs?: number } = {}): Promise<Client> {
@@ -26,7 +31,7 @@ const searchAttributesFor = (orderKey: string) => [
  * Starts the order's workflow. A double click joins the running one. Once a run has finished, a
  * retry or the sweep can start another, which is safe because each pass only writes differences.
  */
-export function startOrderDelivery(client: Client, input: OrderDeliveryInput, taskQueue: string) {
+export function startOrderDelivery(client: Client, input: OrderDeliveryInput, taskQueue: string, options: { priorityKey?: number } = {}) {
   return client.workflow.start<(input: OrderDeliveryInput) => Promise<DeliveryResult>>("deliverOrderToFulfillment", {
     taskQueue,
     workflowId: workflowIdFor(input.orderKey),
@@ -34,19 +39,21 @@ export function startOrderDelivery(client: Client, input: OrderDeliveryInput, ta
     workflowIdConflictPolicy: "USE_EXISTING",
     workflowIdReusePolicy: "ALLOW_DUPLICATE",
     typedSearchAttributes: searchAttributesFor(input.orderKey),
+    staticSummary: `Deliver order ${input.orderKey} to Fulfillment Manager`,
+    priority: options.priorityKey === undefined ? undefined : { priorityKey: options.priorityKey },
   });
 }
 
 /**
- * Passes on an Oracle event: it wakes the running workflow to check now, or starts one if approval
- * missed it. Polling still runs without events, so a lost event only costs time.
+ * For an Oracle event or an operator: wakes the running workflow to check now, or starts one if there
+ * isn't one. Polling still runs without this, so a lost event only costs time.
  */
-export function notifyOracleEvent(client: Client, input: { orderKey: string; settings: DeliverySettings }, taskQueue: string) {
+export function requestCheckNow(client: Client, input: { orderKey: string; settings: DeliverySettings }, taskQueue: string) {
   return client.workflow.signalWithStart<(input: OrderDeliveryInput) => Promise<DeliveryResult>, []>("deliverOrderToFulfillment", {
     taskQueue,
     workflowId: workflowIdFor(input.orderKey),
-    args: [{ orderKey: input.orderKey, trigger: "oracle-event", settings: input.settings }],
-    signal: "oracleEventArrived",
+    args: [{ orderKey: input.orderKey, trigger: "check-now", settings: input.settings }],
+    signal: "checkNow",
     signalArgs: [],
     workflowIdConflictPolicy: "USE_EXISTING",
     workflowIdReusePolicy: "ALLOW_DUPLICATE",
@@ -93,8 +100,15 @@ export function createRecoveryStarter(client: Client, taskQueue: string, setting
       let runs = 0;
       for await (const _run of client.workflow.list({ query: `WorkflowId = "${workflowIdFor(orderKey).replace(/["\\]/g, "\\$&")}"` })) runs += 1;
       if (runs >= maxRuns) return "capped";
-      await startOrderDelivery(client, { orderKey, trigger: "recovery", settings }, taskQueue);
+      await startOrderDelivery(client, { orderKey, trigger: "recovery", settings }, taskQueue, { priorityKey: RECOVERY_PRIORITY });
       return "started";
+    },
+    /** For the delivery audit. There's no settle watch, because the order is already settled. */
+    async recheck(orderKey: string): Promise<"rechecking" | "running"> {
+      const current = await describeOrderDelivery(client, orderKey);
+      if (current?.status === "RUNNING") return "running";
+      await startOrderDelivery(client, { orderKey, trigger: "audit", settings: { ...settings, settleWatchMs: 0 } }, taskQueue, { priorityKey: AUDIT_PRIORITY });
+      return "rechecking";
     },
   };
 }
@@ -114,5 +128,23 @@ export async function ensureRecoverySchedule(client: Client, options: { taskQueu
   } catch (error) {
     if (!(error instanceof ScheduleAlreadyRunning)) throw error;
     await client.schedule.getHandle(RECOVERY_SCHEDULE_ID).update((current) => ({ ...current, spec, action }));
+  }
+}
+
+/** Creates the delivery audit schedule, or updates it so new settings apply. */
+export async function ensureAuditSchedule(client: Client, options: { taskQueue: string; everyMs: number; input: RecoveryInput }): Promise<void> {
+  const spec = { intervals: [{ every: options.everyMs }] };
+  const action = {
+    type: "startWorkflow" as const,
+    workflowType: "deliveryAuditWorkflow",
+    workflowId: "order-delivery-audit-run",
+    taskQueue: options.taskQueue,
+    args: [options.input],
+  };
+  try {
+    await client.schedule.create({ scheduleId: AUDIT_SCHEDULE_ID, spec, action, policies: { overlap: ScheduleOverlapPolicy.SKIP } });
+  } catch (error) {
+    if (!(error instanceof ScheduleAlreadyRunning)) throw error;
+    await client.schedule.getHandle(AUDIT_SCHEDULE_ID).update((current) => ({ ...current, spec, action }));
   }
 }

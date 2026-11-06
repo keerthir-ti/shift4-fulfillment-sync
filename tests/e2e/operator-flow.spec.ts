@@ -28,7 +28,7 @@ test("warehouse stays empty after oracle is ready until the snapshot", async ({ 
   const lab = await (await page.request.get("/api/lab")).json();
   const fulfillmentReads = (lab.traces as { source: string; target: string; url: string }[]).filter((trace) => trace.source === "fulfillment-read");
   expect(fulfillmentReads.length).toBeGreaterThan(0);
-  expect(fulfillmentReads.every((trace) => trace.target === "foundry" && trace.url.includes("ShipmentLine"))).toBe(true);
+  expect(fulfillmentReads.every((trace) => trace.target === "foundry" && trace.url.includes("FulfillmentOrder"))).toBe(true);
   expect(browserUrls.some((url) => url.includes("/api/fulfillment"))).toBe(true);
   const appOrigin = new URL(page.url()).origin;
   expect(browserUrls.every((url) => url.startsWith(appOrigin))).toBe(true);

@@ -20,7 +20,7 @@ endif
 
 COMPOSE := docker compose
 
-.PHONY: help check problem solution stop status logs health reset explain clean verify-docker test typecheck boundaries
+.PHONY: help check problem solution stop status logs health reset explain retry clean verify-docker test typecheck boundaries
 
 help: ## Show this list
 	@echo "Fulfillment sync: see an approved order wait for the warehouse, then see the fix."
@@ -67,6 +67,9 @@ reset: ## Clear all orders and start the scenario again
 
 explain: ## Explain one order: make explain ORDER=<SourceTransactionNumber>
 	@curl -sf "http://127.0.0.1:$(WEB_PORT)/api/order-delivery?orderKey=$(ORDER)" && echo || (echo "No answer. Is the app running, and did you set ORDER?"; exit 1)
+
+retry: ## Ask an order to check now: make retry ORDER=<SourceTransactionNumber>
+	@curl -sf -X POST -H "content-type: application/json" -d '{"orderKey":"$(ORDER)"}' http://127.0.0.1:$(WEB_PORT)/api/order-delivery && echo || (echo "No answer. Run make solution first, and set ORDER."; exit 1)
 
 clean: ## Remove the containers, the image and all simulator data
 	$(COMPOSE) --profile sync down -v --rmi local

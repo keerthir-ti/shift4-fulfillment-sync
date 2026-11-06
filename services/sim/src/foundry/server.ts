@@ -2,11 +2,16 @@ import type { AddressInfo } from "node:net";
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import {
   EDIT_ONLY_PROPERTIES,
+  fulfillmentOrderContent,
+  fulfillmentOrderKey,
+  fulfillmentOrderRow,
+  fulfillmentOrders,
   salesOrderKey,
   salesOrderLineKey,
   shipmentContent,
   shipmentLineKey,
   shipmentSnapshotRow,
+  type FulfillmentOrderView,
   type ObjectType,
   type OracleShipment,
   type Profile,
@@ -148,6 +153,7 @@ export function buildFoundryApp(ctx: FoundryContext): FastifyInstance {
       rows?: SnapshotRow[];
       objectTypes?: ObjectType[];
       immediate?: boolean;
+      append?: boolean;
     };
     if (!body.kind || !Array.isArray(body.rows) || typeof body.capturedAt !== "number") {
       return reply.code(400).send({ message: "kind, capturedAt, and rows are required" });
@@ -163,16 +169,19 @@ export function buildFoundryApp(ctx: FoundryContext): FastifyInstance {
       });
     }
     const id = body.id ?? `gen-${ctx.generationSeq++}`;
-    ctx.store.writeGeneration(id, body.kind, body.capturedAt, ctx.clock.now(), body.rows, objectTypes);
+    const append = body.append === true;
+    const derived = objectTypes.includes("ShipmentLine") ? transformToFulfillmentOrders(ctx, body.rows, append) : [];
+    const types: ObjectType[] = derived.length > 0 || (objectTypes.includes("ShipmentLine") && !append) ? [...new Set<ObjectType>([...objectTypes, "FulfillmentOrder"])] : objectTypes;
+    ctx.store.writeGeneration(id, body.kind, body.capturedAt, ctx.clock.now(), [...body.rows, ...derived], types);
     if (body.immediate) {
-      ctx.store.publish(id, ctx.clock.now());
+      ctx.store.publish(id, ctx.clock.now(), { append });
       ctx.events.record("foundry.indexed", { operationId: id, detail: { kind: body.kind, immediate: true } });
       return { ok: true, id, indexed: true };
     }
     const indexingMs = ctx.profile.indexingMs + body.rows.length * ctx.profile.indexingMsPerRow;
     scheduleIndex(ctx.store, ctx.clock, () => ctx.epoch, id, ctx.clock.now() + indexingMs, () => {
       ctx.events.record("foundry.indexed", { operationId: id, detail: { kind: body.kind } });
-    });
+    }, { append });
     return { ok: true, id, indexed: false };
   });
 
@@ -309,36 +318,64 @@ function setWarehouseLock(ctx: FoundryContext, parameters: Record<string, unknow
   return { ok: true, objectKey: key };
 }
 
+/** The transform: fulfillment orders come from shipment lines. An incremental run needs the order's other lines too. */
+function transformToFulfillmentOrders(ctx: FoundryContext, rows: SnapshotRow[], append: boolean): SnapshotRow[] {
+  const lines = rows.filter((row) => row.objectType === "ShipmentLine" && typeof row.properties.OrderNumber === "string");
+  const byKey = new Map(lines.map((row) => [row.objectKey, row.properties]));
+  if (append) {
+    const touched = new Set(lines.map((row) => row.properties.OrderNumber));
+    for (const existing of ctx.store.listIndexed("ShipmentLine")) {
+      if (touched.has(existing.properties.OrderNumber) && !byKey.has(existing.objectKey)) byKey.set(existing.objectKey, existing.properties);
+    }
+  }
+  return fulfillmentOrders([...byKey.values()]).map(fulfillmentOrderRow);
+}
+
 /**
  * The workflow's write, as Foundry edits. Each row is checked on its own, so one row can't block
  * the others. A row is skipped if Foundry holds a newer version, or the same version unchanged.
+ * Nothing makes a fulfillment order appear unless the caller sends it, as with a real Action.
  */
 function syncShipmentLines(ctx: FoundryContext, parameters: Record<string, unknown>, reply: FastifyReply) {
   const rows = Array.isArray(parameters.rows) ? (parameters.rows as OracleShipment[]) : [];
-  if (rows.length === 0) return reply.code(400).send({ code: "VALIDATION", message: "rows are required" });
+  const orders = Array.isArray(parameters.fulfillmentOrders) ? (parameters.fulfillmentOrders as FulfillmentOrderView[]) : [];
+  if (rows.length === 0 && orders.length === 0) return reply.code(400).send({ code: "VALIDATION", message: "rows or fulfillmentOrders are required" });
   const prepared = rows.map((row) => ({ shipment: row, snapshotRow: shipmentSnapshotRow(row) }));
   const ambiguous = prepared.find(({ snapshotRow }) => !correlates(snapshotRow.properties));
   if (ambiguous) return reply.code(400).send({ code: "VALIDATION", message: `ambiguous shipment correlation for ${ambiguous.snapshotRow.objectKey}` });
   const editedAt = ctx.clock.now() + ctx.editClockOffsetMs;
+  const applyEdit = (row: SnapshotRow) => {
+    for (const [property, value] of Object.entries(row.properties)) ctx.store.upsertEdit(row.objectType, row.objectKey, property, value, editedAt, "source");
+    // Foundry guarantees reads after an edit include it, so the object changes at once.
+    ctx.store.upsertIndexed(row.objectType, row.objectKey, row.properties, ctx.clock.now(), row.sourceTimestamp);
+  };
   let applied = 0;
   for (const { shipment, snapshotRow } of prepared) {
     const held = ctx.store.getIndexed("ShipmentLine", snapshotRow.objectKey) as OracleShipment | undefined;
     if (held && (held.LastUpdateDate > shipment.LastUpdateDate || (held.LastUpdateDate === shipment.LastUpdateDate && shipmentContent(held) === shipmentContent(shipment)))) continue;
-    for (const [property, value] of Object.entries(snapshotRow.properties)) ctx.store.upsertEdit("ShipmentLine", snapshotRow.objectKey, property, value, editedAt, "source");
-    // Foundry guarantees reads after an edit include it, so the object changes at once.
-    ctx.store.upsertIndexed("ShipmentLine", snapshotRow.objectKey, snapshotRow.properties, ctx.clock.now(), snapshotRow.sourceTimestamp);
+    applyEdit(snapshotRow);
     applied += 1;
   }
-  ctx.events.record("foundry.action.applied", { orderId: String(rows[0].OrderNumber), operationId: "sync-shipment-lines", detail: { applied, skipped: rows.length - applied } });
-  return { ok: true, applied, skipped: rows.length - applied };
+  let ordersApplied = 0;
+  for (const order of orders) {
+    const row = fulfillmentOrderRow(order);
+    const held = ctx.store.getIndexed("FulfillmentOrder", row.objectKey) as FulfillmentOrderView | undefined;
+    if (held && fulfillmentOrderContent(held) === fulfillmentOrderContent(order) && held.lastUpdateDate >= order.lastUpdateDate) continue;
+    applyEdit(row);
+    ordersApplied += 1;
+  }
+  ctx.events.record("foundry.action.applied", { orderId: String(rows[0]?.OrderNumber ?? orders[0]?.orderNumber), operationId: "sync-shipment-lines", detail: { applied, skipped: rows.length - applied, ordersApplied } });
+  return { ok: true, applied, skipped: rows.length - applied, ordersApplied };
 }
 
 function removeShipmentLines(ctx: FoundryContext, parameters: Record<string, unknown>, reply: FastifyReply) {
   const lines = Array.isArray(parameters.shipmentLines) ? (parameters.shipmentLines as string[]) : [];
-  if (lines.length === 0) return reply.code(400).send({ code: "VALIDATION", message: "shipmentLines are required" });
+  const orders = Array.isArray(parameters.fulfillmentOrders) ? (parameters.fulfillmentOrders as { orderNumber: string; warehouse: string }[]) : [];
+  if (lines.length === 0 && orders.length === 0) return reply.code(400).send({ code: "VALIDATION", message: "shipmentLines or fulfillmentOrders are required" });
   for (const line of lines) ctx.store.deleteObject("ShipmentLine", shipmentLineKey(line));
-  ctx.events.record("foundry.action.applied", { operationId: "remove-shipment-lines", detail: { removed: lines.length } });
-  return { ok: true, removed: lines.length };
+  for (const order of orders) ctx.store.deleteObject("FulfillmentOrder", fulfillmentOrderKey(order.orderNumber, order.warehouse));
+  ctx.events.record("foundry.action.applied", { operationId: "remove-shipment-lines", detail: { removed: lines.length, ordersRemoved: orders.length } });
+  return { ok: true, removed: lines.length, ordersRemoved: orders.length };
 }
 
 function recordFulfillmentSync(ctx: FoundryContext, parameters: Record<string, unknown>, reply: FastifyReply) {
@@ -388,5 +425,5 @@ function correlates(properties: Record<string, unknown>): boolean {
 }
 
 function isObjectType(value: string): value is ObjectType {
-  return value === "SalesOrder" || value === "SalesOrderLine" || value === "ShipmentLine";
+  return value === "SalesOrder" || value === "SalesOrderLine" || value === "ShipmentLine" || value === "FulfillmentOrder";
 }

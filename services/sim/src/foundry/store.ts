@@ -205,13 +205,13 @@ export class FoundryStore {
    * datasource's timestamp, and the edit wins only if it's newer. An object an Action created stays when
    * its source row disappears, and an object deleted by an Action stays deleted if the row reappears.
    */
-  publish(generationId: string, indexedAt: number): void {
+  publish(generationId: string, indexedAt: number, options: { append?: boolean } = {}): void {
     const rows = this.rows(generationId);
     const declared = this.db.get<{ object_types_json: string }>("SELECT object_types_json FROM generations WHERE id = ?", generationId);
     const types = (declared ? (JSON.parse(declared.object_types_json) as ObjectType[]) : [...new Set(rows.map((row) => row.objectType))]);
     this.db.transaction(() => {
       for (const objectType of types) {
-        this.db.run("DELETE FROM indexed_objects WHERE object_type = ?", objectType);
+        if (!options.append) this.db.run("DELETE FROM indexed_objects WHERE object_type = ?", objectType);
         const deleted = new Set(this.db.all<{ object_key: string }>("SELECT object_key FROM deleted_objects WHERE object_type = ?", objectType).map((row) => row.object_key));
         const backed = new Set<string>();
         for (const row of rows.filter((candidate) => candidate.objectType === objectType)) {
@@ -225,7 +225,7 @@ export class FoundryStore {
             EDIT_ONLY_PROPERTIES,
           );
           this.db.run(
-            `INSERT INTO indexed_objects (object_type, object_key, properties_json, indexed_at, source_timestamp)
+            `INSERT OR REPLACE INTO indexed_objects (object_type, object_key, properties_json, indexed_at, source_timestamp)
              VALUES (?, ?, ?, ?, ?)`,
             objectType,
             row.objectKey,
@@ -234,6 +234,7 @@ export class FoundryStore {
             row.sourceTimestamp,
           );
         }
+        if (options.append) continue;
         const created = this.db.all<{ object_key: string }>("SELECT DISTINCT object_key FROM edits WHERE object_type = ? AND ownership = 'source'", objectType);
         for (const { object_key: objectKey } of created) {
           if (backed.has(objectKey) || deleted.has(objectKey)) continue;
@@ -291,7 +292,7 @@ export class FoundryStore {
   }
 
   getIndexed(objectType: ObjectType, objectKey: string): Record<string, unknown> | undefined {
-    return this.listIndexed(objectType).find((row) => row.objectKey === objectKey)?.properties;
+    return this.getIndexedRow(objectType, objectKey)?.properties;
   }
 
   close(): void {

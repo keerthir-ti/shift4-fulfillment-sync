@@ -325,7 +325,8 @@ function resolveOrders(ctx: OracleContext, query: Record<string, string>) {
 
 function resolveShipments(ctx: OracleContext, query: Record<string, string>): ShipmentRecord[] | undefined {
   if (!query.captureToken) return query.orderNumber ? ctx.store.shipmentsForOrder(query.orderNumber) : ctx.store.shipments();
-  const frozen = ctx.store.capture(query.captureToken)?.shipments;
+  let frozen = ctx.store.capture(query.captureToken)?.shipments;
+  if (query.updatedSince) frozen = frozen?.filter((row) => row.lastUpdateMs >= Number(query.updatedSince));
   return query.orderNumber ? frozen?.filter((row) => row.orderNumber === query.orderNumber) : frozen;
 }
 

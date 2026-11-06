@@ -22,6 +22,8 @@ export type ConnectorContext = {
   nextOrderSnapshotAt: number | null;
   runningKinds: Set<SnapshotKind>;
   queuedKinds: Set<SnapshotKind>;
+  /** When the last successful shipment-line run started, for incremental runs. */
+  lastShipmentCaptureAt: number | null;
 };
 
 export type RunningConnector = {
@@ -58,6 +60,7 @@ export async function startConnector(options: {
     nextOrderSnapshotAt: null,
     runningKinds: new Set(),
     queuedKinds: new Set(),
+    lastShipmentCaptureAt: null,
   };
   const app = Fastify({ logger: false });
 
@@ -147,6 +150,7 @@ async function resetAndArm(ctx: ConnectorContext): Promise<void> {
   ctx.store.reset();
   ctx.events.clear();
   ctx.failNext = false;
+  ctx.lastShipmentCaptureAt = null;
   ctx.origin = ctx.clock.now();
   await fetch(`${ctx.oracleUrl}/lab/reset`, { method: "POST" }).catch(() => undefined);
   await fetch(`${ctx.foundryUrl}/lab/reset`, { method: "POST" }).catch(() => undefined);
@@ -190,6 +194,7 @@ async function runCapture(ctx: ConnectorContext, kind: SnapshotKind, capturedAt:
   const epoch = ctx.epoch;
   const isCurrent = () => ctx.epoch === epoch;
   ctx.runningKinds.add(kind);
+  const incremental = !initialLoad && kind === "shipment-lines" && ctx.profile.connectorMode === "incremental" && ctx.lastShipmentCaptureAt !== null;
 
   const release = async () => {
     if (!isCurrent()) return;
@@ -206,6 +211,7 @@ async function runCapture(ctx: ConnectorContext, kind: SnapshotKind, capturedAt:
     events: ctx.events,
     clock: ctx.clock,
     initialLoad,
+    updatedSince: incremental ? ctx.lastShipmentCaptureAt! : undefined,
     isCurrent,
     failNext: () => {
       if (!ctx.failNext) return false;
@@ -223,7 +229,8 @@ async function runCapture(ctx: ConnectorContext, kind: SnapshotKind, capturedAt:
         return release();
       }
       const commit = async () => {
-        await commitSnapshot({ id: captured.id, foundryUrl: ctx.foundryUrl, store: ctx.store, events: ctx.events, immediate: initialLoad });
+        await commitSnapshot({ id: captured.id, foundryUrl: ctx.foundryUrl, store: ctx.store, events: ctx.events, immediate: initialLoad, append: incremental });
+        if (kind === "shipment-lines") ctx.lastShipmentCaptureAt = capturedAt;
         await release();
       };
       onResult?.({ ok: true, id: captured.id });

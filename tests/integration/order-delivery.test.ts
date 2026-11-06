@@ -12,11 +12,13 @@ import { readFulfillment, readOrders } from "../../apps/web/lib/reads.js";
 import { acceleratedProfile, type OracleShipment, type Profile } from "../../packages/contracts/src/index.js";
 import { createActivities, type ActivityDeps } from "../../packages/order-delivery/src/activities.js";
 import {
+  AUDIT_SCHEDULE_ID,
   connectTemporal,
   createRecoveryStarter,
   describeOrderDelivery,
+  ensureAuditSchedule,
   ensureRecoverySchedule,
-  notifyOracleEvent,
+  requestCheckNow,
   RECOVERY_SCHEDULE_ID,
   startOrderDelivery,
   workflowIdFor,
@@ -83,7 +85,8 @@ const submitInOracle = (headerId: string) => send(`${stack.oracle.url}${PREFIX}/
 const hooksFor = (taskQueue: string, settings = fast()) => createSyncHooks({ client: async () => env.client, taskQueue, settings });
 const downHooks = () => createSyncHooks({ client: async () => { throw new Error("Temporal down"); }, taskQueue: "unused", settings: fast() });
 const result = (orderKey: string) => env.client.workflow.getHandle(workflowIdFor(orderKey)).result();
-const foundryLines = async (orderNumber: string) => (await readFulfillment()).items.filter((row) => row.properties.OrderNumber === orderNumber);
+const foundryLines = async (orderNumber: string) => ((await send(`${stack.foundry.url}/lab/query/ShipmentLine`)).body.items as { properties: Record<string, unknown> }[]).filter((row) => row.properties.OrderNumber === orderNumber);
+const warehouseView = async (orderNumber: string) => (await readFulfillment()).orders.filter((order) => order.orderNumber === orderNumber);
 const syncStatus = async (orderNumber: string) => (await readOrders()).items.find((row: { properties: { orderNumber: string } }) => row.properties.orderNumber === orderNumber)?.properties.fulfillmentSync;
 const oracleRows = async (orderNumber: string) => (await send(`${stack.oracle.url}${PREFIX}/shipmentLines?orderNumber=${orderNumber}`)).body.items as OracleShipment[];
 const sim = (path: string, body: unknown) => send(`${path}`, { method: "POST", body: JSON.stringify(body) });
@@ -113,6 +116,65 @@ describe("normal flow", () => {
       expect(final.stages).toEqual(["AwaitingSubmittedOrder", "AwaitingShipmentCoverage", "Reconciling", "DeliveryVerified"]);
       expect(await foundryLines(order.orderNumber)).toHaveLength(1);
       expect(await syncStatus(order.orderNumber)).toMatchObject({ stage: "DeliveryVerified" });
+      expect(await warehouseView(order.orderNumber)).toEqual([expect.objectContaining({ orderNumber: order.orderNumber, warehouse: "WH-DUB", status: "Ready to Release", lineCount: 1, activeQuantity: 2 })]);
+      expect(final.timings.awaitingOracleMs).toBeGreaterThan(0);
+      expect(final.timings.totalMs).toBeGreaterThanOrEqual(final.timings.awaitingOracleMs!);
+    });
+  });
+
+  it("isn't delivered until the fulfillment order the warehouse reads exists and is correct", async () => {
+    const order = await draft();
+    await submitInOracle(order.headerId);
+    await sleep(500);
+    const deps = gateways();
+    const realWrite = deps.foundry.writeFulfillment;
+    let firstWrite = true;
+    // The first write reaches the lines but not the fulfillment order, like an action that only did half its job.
+    deps.foundry.writeFulfillment = async (data) => {
+      if (!firstWrite) return realWrite(data);
+      firstWrite = false;
+      return realWrite({ lines: data.lines, orders: [] });
+    };
+    await withWorker(deps, async (taskQueue) => {
+      const final = await (await startOrderDelivery(env.client, { orderKey: order.orderKey, trigger: "approved", settings: fast() }, taskQueue)).result();
+      expect(final).toMatchObject({ status: "DeliveryVerified", reconcilePasses: 3 });
+    });
+    expect(await warehouseView(order.orderNumber)).toHaveLength(1);
+  });
+
+  it("keeps the fulfillment order's status right when Oracle moves a line on", async () => {
+    await withWorker(gateways(), async (taskQueue) => {
+      const order = await draft();
+      await approveOrder(order, hooksFor(taskQueue));
+      await result(order.orderKey);
+      const [row] = await oracleRows(order.orderNumber);
+      await sim(`${stack.oracle.url}/lab/shipments/${row.ShipmentLine}`, { lineStatus: "Staged" });
+      await (await startOrderDelivery(env.client, { orderKey: order.orderKey, trigger: "audit", settings: fast() }, taskQueue)).result();
+      expect((await warehouseView(order.orderNumber))[0]).toMatchObject({ status: "Staged" });
+    });
+  });
+
+  it("accepts an order key that carries source system and ID", async () => {
+    await withWorker(gateways(), async (taskQueue) => {
+      const orderKey = `ORDERHUB:${randomUUID().slice(0, 8)}`;
+      const created = await createOrder({ buyingPartyName: "Synthetic Merchant Ltd", organizationCode: "WH-DUB", productNumber: "POS-ACC", quantity: 1, sourceTransactionNumber: orderKey });
+      if (!created.ok) throw new Error(created.message);
+      await approveOrder({ headerId: created.headerId, orderNumber: created.orderNumber }, hooksFor(taskQueue));
+      expect(await result(orderKey)).toMatchObject({ status: "DeliveryVerified", orderKey });
+    });
+  });
+
+  it("shows live status and a summary in the Temporal UI", async () => {
+    await useStackWith(NEVER_MS);
+    await withWorker(gateways(), async (taskQueue) => {
+      const order = await draft();
+      await approveOrder(order, hooksFor(taskQueue));
+      await sleep(500);
+      const handle = env.client.workflow.getHandle(workflowIdFor(order.orderKey));
+      const metadata = await handle.query<{ currentDetails?: string }>("__temporal_workflow_metadata");
+      expect(metadata.currentDetails).toContain("AwaitingShipmentCoverage");
+      expect(await (await handle.describe()).staticSummary()).toContain(order.orderKey);
+      await handle.terminate();
     });
   });
 
@@ -263,6 +325,43 @@ describe("recovery sweep", () => {
     });
   });
 
+  it("the audit corrects drift on a delivered order, and leaves matching orders unchanged", async () => {
+    await withWorker(gateways(), async (taskQueue) => {
+      const order = await draft();
+      await approveOrder(order, hooksFor(taskQueue));
+      await result(order.orderKey);
+      const firstRun = (await env.client.workflow.getHandle(workflowIdFor(order.orderKey)).describe()).runId;
+      const [row] = await oracleRows(order.orderNumber);
+      await sim(`${stack.oracle.url}/lab/shipments/${row.ShipmentLine}`, { lineStatus: "Staged" });
+      const activities = createActivities({ ...gateways(), recovery: recoveryFor(taskQueue) });
+      expect(await activities.auditDeliveredOrders({ lookbackMs: NEVER_MS, limit: 10 })).toMatchObject({ checked: 1, rechecking: 1, failed: 0 });
+      const handle = env.client.workflow.getHandle(workflowIdFor(order.orderKey));
+      expect((await handle.describe()).runId).not.toBe(firstRun);
+      expect(await handle.result()).toMatchObject({ status: "DeliveryVerified", reconcilePasses: 2 });
+      expect((await foundryLines(order.orderNumber))[0].properties.LineStatus).toBe("Staged");
+      expect((await warehouseView(order.orderNumber))[0]).toMatchObject({ status: "Staged" });
+    });
+  });
+
+  it("runs the audit from a real Temporal Schedule", async () => {
+    const taskQueue = `tq-${randomUUID()}`;
+    const worker = await Worker.create({ connection: env.nativeConnection, taskQueue, workflowBundle: bundle, activities: createActivities({ ...gateways(), recovery: recoveryFor(taskQueue) }) });
+    await worker.runUntil(async () => {
+      const order = await draft();
+      await approveOrder(order, hooksFor(taskQueue));
+      await result(order.orderKey);
+      const firstRun = (await env.client.workflow.getHandle(workflowIdFor(order.orderKey)).describe()).runId;
+      await ensureAuditSchedule(env.client, { taskQueue, everyMs: NEVER_MS, input: { lookbackMs: NEVER_MS, limit: 10, settings: fast() } });
+      const schedule = env.client.schedule.getHandle(AUDIT_SCHEDULE_ID);
+      await schedule.trigger();
+      const handle = env.client.workflow.getHandle(workflowIdFor(order.orderKey));
+      for (let waited = 0; waited < 10_000 && (await handle.describe()).runId === firstRun; waited += 100) await sleep(100);
+      expect((await handle.describe()).runId).not.toBe(firstRun);
+      expect(await handle.result()).toMatchObject({ status: "DeliveryVerified" });
+      await schedule.delete();
+    });
+  });
+
   it("stops restarting an order after its limit, and never restarts a delivered one", async () => {
     await withWorker(gateways(), async (taskQueue) => {
       const delivered = await draft();
@@ -312,7 +411,7 @@ describe("reconciling", () => {
         await sleep(5);
         await sim(`${stack.oracle.url}/lab/shipments/${rows[0].ShipmentLine}`, { lineStatus: "Staged" });
         const [changed] = await oracleRows(orderNumber);
-        await deps.foundry.writeShipmentLines([changed]);
+        await deps.foundry.writeFulfillment({ lines: [changed], orders: [] });
       }
       return rows;
     };
@@ -328,15 +427,15 @@ describe("reconciling", () => {
     await submitInOracle(order.headerId);
     await sleep(500);
     const deps = gateways();
-    const realWrite = deps.foundry.writeShipmentLines;
+    const realWrite = deps.foundry.writeFulfillment;
     let changed = false;
-    deps.foundry.writeShipmentLines = async (rows) => {
+    deps.foundry.writeFulfillment = async (data) => {
       if (!changed) {
         changed = true;
         await sleep(5);
-        await sim(`${stack.oracle.url}/lab/shipments/${rows[0].ShipmentLine}`, { lineStatus: "Staged" });
+        await sim(`${stack.oracle.url}/lab/shipments/${data.lines[0].ShipmentLine}`, { lineStatus: "Staged" });
       }
-      return realWrite(rows);
+      return realWrite(data);
     };
     await withWorker(deps, async (taskQueue) => {
       const final = await (await startOrderDelivery(env.client, { orderKey: order.orderKey, trigger: "approved", settings: fast() }, taskQueue)).result();
@@ -350,11 +449,11 @@ describe("reconciling", () => {
     await submitInOracle(order.headerId);
     await sleep(500);
     const deps = gateways();
-    const realWrite = deps.foundry.writeShipmentLines;
+    const realWrite = deps.foundry.writeFulfillment;
     let attempts = 0;
-    deps.foundry.writeShipmentLines = async (rows) => {
+    deps.foundry.writeFulfillment = async (data) => {
       attempts += 1;
-      await realWrite(rows);
+      await realWrite(data);
       throw new SystemHttpError("foundry", 0, "response lost after the write");
     };
     await withWorker(deps, async (taskQueue) => {
@@ -371,7 +470,7 @@ describe("reconciling", () => {
     await sleep(500);
     const [real] = await oracleRows(order.orderNumber);
     const deps = gateways();
-    await deps.foundry.writeShipmentLines([{ ...real, ShipmentLine: "gone-from-oracle" }]);
+    await deps.foundry.writeFulfillment({ lines: [{ ...real, ShipmentLine: "gone-from-oracle" }], orders: [] });
     await withWorker(deps, async (taskQueue) => {
       const final = await (await startOrderDelivery(env.client, { orderKey: order.orderKey, trigger: "approved", settings: fast() }, taskQueue)).result();
       expect(final).toMatchObject({ status: "DeliveryVerified", linesVerified: 1 });
@@ -398,10 +497,10 @@ describe("reconciling", () => {
     await submitInOracle(order.headerId);
     await sleep(500);
     const deps = gateways();
-    const realWrite = deps.foundry.writeShipmentLines;
-    deps.foundry.writeShipmentLines = async (rows) => {
+    const realWrite = deps.foundry.writeFulfillment;
+    deps.foundry.writeFulfillment = async (data) => {
       await addLine(order.headerId);
-      return realWrite(rows);
+      return realWrite(data);
     };
     await withWorker(deps, async (taskQueue) => {
       const final = await (await startOrderDelivery(env.client, { orderKey: order.orderKey, trigger: "approved", settings: fast({ reconcileWindowMs: 2_500 }) }, taskQueue)).result();
@@ -428,7 +527,7 @@ describe("reconciling", () => {
     await submitInOracle(order.headerId);
     await sleep(500);
     const deps = gateways();
-    deps.foundry.readShipmentLines = async () => [];
+    deps.foundry.readFulfillment = async () => ({ lines: [], orders: [] });
     await withWorker(deps, async (taskQueue) => {
       const final = await (await startOrderDelivery(env.client, { orderKey: order.orderKey, trigger: "approved", settings: fast({ maxReconcilePasses: 2 }) }, taskQueue)).result();
       expect(final.status).toBe("ActionRequired");
@@ -519,12 +618,12 @@ describe("settle watch", () => {
     await submitInOracle(order.headerId);
     await sleep(500);
     const deps = gateways();
-    const realRead = deps.foundry.readShipmentLines;
+    const realRead = deps.foundry.readFulfillment;
     let verified = false;
     deps.foundry.recordDeliveryStatus = async (entry) => {
       if (entry.stage === "DeliveryVerified") verified = true;
     };
-    deps.foundry.readShipmentLines = async (orderNumber) => (verified ? [] : realRead(orderNumber));
+    deps.foundry.readFulfillment = async (orderNumber) => (verified ? { lines: [], orders: [] } : realRead(orderNumber));
     await withWorker(deps, async (taskQueue) => {
       const final = await (await startOrderDelivery(env.client, { orderKey: order.orderKey, trigger: "approved", settings: fast({ settleWatchMs: 300 }) }, taskQueue)).result();
       expect(final.status).toBe("ActionRequired");
@@ -543,9 +642,9 @@ describe("Oracle events", () => {
       const handle = await startOrderDelivery(env.client, { orderKey: order.orderKey, trigger: "approved", settings: slow }, taskQueue);
       await submitInOracle(order.headerId);
       await sleep(1_500);
-      await notifyOracleEvent(env.client, { orderKey: order.orderKey, settings: slow }, taskQueue);
+      await requestCheckNow(env.client, { orderKey: order.orderKey, settings: slow }, taskQueue);
       await sleep(300);
-      await notifyOracleEvent(env.client, { orderKey: order.orderKey, settings: slow }, taskQueue);
+      await requestCheckNow(env.client, { orderKey: order.orderKey, settings: slow }, taskQueue);
       expect(await handle.result()).toMatchObject({ status: "DeliveryVerified" });
       expect(Date.now() - started).toBeLessThan(20_000);
     });
@@ -556,7 +655,7 @@ describe("Oracle events", () => {
       const order = await draft();
       await submitInOracle(order.headerId);
       await sleep(500);
-      await notifyOracleEvent(env.client, { orderKey: order.orderKey, settings: fast() }, taskQueue);
+      await requestCheckNow(env.client, { orderKey: order.orderKey, settings: fast() }, taskQueue);
       expect(await result(order.orderKey)).toMatchObject({ status: "DeliveryVerified" });
     });
   });
@@ -711,7 +810,7 @@ describe("failures", () => {
     await sleep(500);
     const deps = gateways();
     let reads = 0;
-    deps.foundry.readShipmentLines = async () => {
+    deps.foundry.readFulfillment = async () => {
       reads += 1;
       throw new TypeError("Not a usable timestamp: yesterday");
     };
@@ -738,11 +837,11 @@ describe("failures", () => {
     await sleep(500);
     const deps = gateways();
     let writes = 0;
-    const realWrite = deps.foundry.writeShipmentLines;
-    deps.foundry.writeShipmentLines = async (rows) => {
+    const realWrite = deps.foundry.writeFulfillment;
+    deps.foundry.writeFulfillment = async (data) => {
       writes += 1;
       await sim(`${stack.foundry.url}/lab/faults`, { mode: "validation" });
-      return realWrite(rows);
+      return realWrite(data);
     };
     await withWorker(deps, async (taskQueue) => {
       const final = await (await startOrderDelivery(env.client, { orderKey: order.orderKey, trigger: "approved", settings: fast() }, taskQueue)).result();

@@ -54,6 +54,8 @@ export async function captureSnapshot(options: {
   failNext: () => boolean;
   /** The first load at startup, which models data already in place, so it costs no time or budget. */
   initialLoad: boolean;
+  /** Set for an incremental run: read only rows changed since this time. */
+  updatedSince?: number;
   isCurrent: () => boolean;
   onFinished: (result: CaptureResult) => Promise<void>;
 }): Promise<void> {
@@ -75,7 +77,7 @@ export async function captureSnapshot(options: {
 
   const readPagesFrom = async (start: number): Promise<void> => {
     for (let offset = start; ; offset += profile.pageSize) {
-      const url = `${options.oracleUrl}${path}?captureToken=${encodeURIComponent(token)}&limit=${profile.pageSize}&offset=${offset}`;
+      const url = `${options.oracleUrl}${path}?captureToken=${encodeURIComponent(token)}&limit=${profile.pageSize}&offset=${offset}${options.updatedSince === undefined ? "" : `&updatedSince=${options.updatedSince}`}`;
       const response = await fetch(url, { headers });
       const retryAfterSec = Number(response.headers.get("retry-after") ?? 0);
       if (response.status === 429 && retryAfterSec > 0) {
@@ -114,6 +116,7 @@ export async function commitSnapshot(options: {
   store: ConnectorStore;
   events: EventLog;
   immediate: boolean;
+  append: boolean;
 }): Promise<{ ok: boolean; message?: string }> {
   const generation = options.store.get(options.id);
   if (!generation) return { ok: false, message: "generation missing" };
@@ -127,6 +130,7 @@ export async function commitSnapshot(options: {
       rows: generation.rows,
       objectTypes: generation.objectTypes,
       immediate: options.immediate,
+      append: options.append,
     }),
   });
   if (!response.ok) {

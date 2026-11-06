@@ -9,7 +9,9 @@ import {
   defineQuery,
   defineSignal,
   isCancellation,
+  metricMeter,
   proxyActivities,
+  setCurrentDetails,
   setHandler,
   sleep,
   TimeoutFailure,
@@ -17,11 +19,11 @@ import {
 } from "@temporalio/workflow";
 import type { Activities } from "./activities";
 import { DELIVERY_OVERDUE, DELIVERY_STAGE } from "./search-attributes";
-import type { DeliveryProgress, DeliveryResult, DeliveryStage, OrderDeliveryInput, OrderReference, ReconcileResult, RecoveryInput, RecoveryResult } from "./types";
+import type { AuditResult, DeliveryProgress, DeliveryResult, DeliveryStage, DeliveryTimings, OrderDeliveryInput, OrderReference, ReconcileResult, RecoveryInput, RecoveryResult } from "./types";
 
 export const getDeliveryProgress = defineQuery<DeliveryProgress>("getDeliveryProgress");
-/** An Oracle event says something changed. It's only a hint to check now: Oracle's data stays the truth. */
-export const oracleEventArrived = defineSignal("oracleEventArrived");
+/** Check now instead of waiting out the backoff, for an Oracle event or an operator. It's only a hint: Oracle's data stays the truth. */
+export const checkNow = defineSignal("checkNow");
 
 const NON_RETRYABLE = ["OracleRejectedRequest", "FoundryRejectedRequest", "UnexpectedActivityError"];
 
@@ -39,7 +41,7 @@ function explain(error: unknown): string {
 }
 
 const describeDifferences = ({ differences }: ReconcileResult) =>
-  `Foundry differs from Oracle: ${differences.missing} missing, ${differences.older} older, ${differences.changed} changed, ${differences.extra} extra.`;
+  `Foundry differs from Oracle: ${differences.missing} missing, ${differences.older} older, ${differences.changed} changed, ${differences.extra} extra, ${differences.orders} fulfillment orders to correct.`;
 
 export async function deliverOrderToFulfillment(input: OrderDeliveryInput): Promise<DeliveryResult> {
   const { orderKey, settings } = input;
@@ -51,11 +53,24 @@ export async function deliverOrderToFulfillment(input: OrderDeliveryInput): Prom
   let passes = 0;
   setHandler(getDeliveryProgress, () => ({ stage, stages, overdue, orderNumber, reason }));
 
+  const startedAt = Date.now();
+  let coveredAt: number | undefined;
+  let verifiedAt: number | undefined;
+  const timings = (): DeliveryTimings => ({
+    awaitingOracleMs: coveredAt === undefined ? undefined : coveredAt - startedAt,
+    reconcilingMs: coveredAt === undefined || verifiedAt === undefined ? undefined : verifiedAt - coveredAt,
+    totalMs: (verifiedAt ?? Date.now()) - startedAt,
+  });
+  const showDetails = () => setCurrentDetails(`**${stage}**${overdue ? " (overdue)" : ""}${orderNumber ? `\n\nOrder ${orderNumber}` : ""}${reason ? `\n\n${reason}` : ""}`);
   const setStage = (next: DeliveryStage) => {
     stage = next;
     stages.push(next);
     upsertSearchAttributes([{ key: DELIVERY_STAGE, value: next }]);
+    showDetails();
   };
+  const outcomes = metricMeter.createCounter("order_delivery_outcomes", "1", "Orders finished, by status");
+  const totalTime = metricMeter.createHistogram("order_delivery_total_ms", "int", "ms", "Start until delivery was verified");
+  const oracleTime = metricMeter.createHistogram("order_delivery_oracle_wait_ms", "int", "ms", "Start until Oracle's lines covered the order");
 
   const deadlineAt = Date.now() + settings.deadlineMs;
   const polling = () =>
@@ -86,7 +101,7 @@ export async function deliverOrderToFulfillment(input: OrderDeliveryInput): Prom
   // A signal cancels the current wait, which skips the backoff and checks Oracle straight away.
   let currentWait: CancellationScope | undefined;
   let woken = false;
-  setHandler(oracleEventArrived, () => {
+  setHandler(checkNow, () => {
     if (!currentWait) return;
     woken = true;
     currentWait.cancel();
@@ -113,6 +128,7 @@ export async function deliverOrderToFulfillment(input: OrderDeliveryInput): Prom
       await sleep(settings.overdueAfterMs);
       overdue = true;
       upsertSearchAttributes([{ key: DELIVERY_OVERDUE, value: true }]);
+      showDetails();
       await note("Overdue", `Past the overdue threshold while in ${stage}. Still working.`);
     })
     // A flag must never decide the outcome, so nothing here can fail the workflow.
@@ -127,7 +143,8 @@ export async function deliverOrderToFulfillment(input: OrderDeliveryInput): Prom
     reason = message;
     setStage(status);
     await note(status, message);
-    return { status, orderKey, orderNumber, reason, reconcilePasses: passes, wentOverdue: overdue, stages };
+    outcomes.add(1, { status });
+    return { status, orderKey, orderNumber, reason, reconcilePasses: passes, wentOverdue: overdue, stages, timings: timings() };
   };
 
   /** Repeats until Foundry matches. One pass writes the differences, and the next verifies them. */
@@ -151,6 +168,8 @@ export async function deliverOrderToFulfillment(input: OrderDeliveryInput): Prom
     setStage("AwaitingShipmentCoverage");
     const coverage = await wakeable(() => polling().checkShipmentCoverage({ order, refreshEvery: settings.orderRefreshEvery }));
     if (coverage.status === "canceled") return await finish("CanceledInOracle", "The order was canceled in Oracle.");
+    coveredAt = Date.now();
+    oracleTime.record(coveredAt - startedAt);
 
     setStage("Reconciling");
     const settled = await reconcileUntilSettled(order);
@@ -158,6 +177,8 @@ export async function deliverOrderToFulfillment(input: OrderDeliveryInput): Prom
     if (settled.outcome === "wrote") return await finish("ActionRequired", describeDifferences(settled));
 
     await stopWatchdog();
+    verifiedAt = Date.now();
+    totalTime.record(verifiedAt - startedAt);
     setStage("DeliveryVerified");
     await note("DeliveryVerified", `Verified ${settled.lines} shipment lines in Foundry.`);
 
@@ -175,7 +196,8 @@ export async function deliverOrderToFulfillment(input: OrderDeliveryInput): Prom
         if (isCancellation(error)) throw error;
       }
     }
-    return { status: "DeliveryVerified", orderKey, orderNumber, linesVerified: verified.lines, reconcilePasses: passes, wentOverdue: overdue, stages };
+    outcomes.add(1, { status: "DeliveryVerified" });
+    return { status: "DeliveryVerified", orderKey, orderNumber, linesVerified: verified.lines, reconcilePasses: passes, wentOverdue: overdue, stages, timings: timings() };
   } catch (error) {
     if (isCancellation(error)) {
       await CancellationScope.nonCancellable(async () => {
@@ -198,4 +220,13 @@ export async function recoverySweepWorkflow(input: RecoveryInput): Promise<Recov
     retry: { maximumAttempts: 3, nonRetryableErrorTypes: ["RecoveryNotConfigured", ...NON_RETRYABLE] },
   });
   return sweep.sweepMissedOrders({ lookbackMs: input.lookbackMs, limit: input.limit });
+}
+
+/** Started by a Temporal Schedule. Rechecks recently delivered orders, which catches drift after a workflow has ended. */
+export async function deliveryAuditWorkflow(input: RecoveryInput): Promise<AuditResult> {
+  const audit = proxyActivities<Activities>({
+    startToCloseTimeout: input.settings.attemptTimeoutMs * 4,
+    retry: { maximumAttempts: 3, nonRetryableErrorTypes: ["RecoveryNotConfigured", ...NON_RETRYABLE] },
+  });
+  return audit.auditDeliveredOrders({ lookbackMs: input.lookbackMs, limit: input.limit });
 }

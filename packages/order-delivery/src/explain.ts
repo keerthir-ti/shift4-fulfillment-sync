@@ -1,5 +1,5 @@
 import type { Client } from "@temporalio/client";
-import { compareRows, activeLines, shipmentCoverage } from "./activities";
+import { activeLines, compareDelivery, shipmentCoverage } from "./activities";
 import { describeOrderDelivery, type DeliveryStatusView } from "./client";
 import type { FoundryFulfillmentStore, OracleOrderReader } from "./system-adapters";
 import type { RowDifferences } from "./types";
@@ -7,7 +7,7 @@ import type { RowDifferences } from "./types";
 export type OrderExplanation = {
   orderKey: string;
   oracle: { found: boolean; orderNumber?: string; submitted?: boolean; status?: string; expectedQuantity?: number; coveredQuantity?: number };
-  foundry: { lines: number; differences?: RowDifferences; matchesOracle?: boolean };
+  foundry: { lines: number; fulfillmentOrders: number; differences?: RowDifferences; matchesOracle?: boolean };
   workflow: DeliveryStatusView | null;
   summary: string;
   nextAction: string;
@@ -25,20 +25,20 @@ export async function explainOrderDelivery(options: { orderKey: string; oracle: 
     return {
       orderKey,
       oracle: { found: false },
-      foundry: { lines: 0 },
+      foundry: { lines: 0, fulfillmentOrders: 0 },
       workflow,
       summary: "Oracle has no order with this source number.",
       nextAction: "Check whether the submit reached Oracle, then approve the order again.",
     };
   }
-  const [oracleRows, foundryRows] = await Promise.all([oracle.listShipmentLines(order.orderNumber), foundry.readShipmentLines(order.orderNumber)]);
+  const [oracleRows, held] = await Promise.all([oracle.listShipmentLines(order.orderNumber), foundry.readFulfillment(order.orderNumber)]);
   const lines = activeLines(order);
   const state = shipmentCoverage(lines, oracleRows);
-  const comparison = compareRows(oracleRows, foundryRows);
+  const comparison = compareDelivery(oracleRows, held);
   const base = {
     orderKey,
     oracle: { found: true, orderNumber: order.orderNumber, submitted: order.submitted, status: order.status, expectedQuantity: state.expected, coveredQuantity: state.found },
-    foundry: { lines: foundryRows.length, differences: comparison.differences, matchesOracle: comparison.inSync },
+    foundry: { lines: held.lines.length, fulfillmentOrders: held.orders.length, differences: comparison.differences, matchesOracle: comparison.inSync },
     workflow,
   };
   const running = workflow?.status === "RUNNING";

@@ -18,6 +18,8 @@ export type Profile = {
   indexingMsPerRow: number;
   /** Oracle REST calls allowed per minute, shared by every caller. null means no limit. */
   oracleCallsPerMinute: number | null;
+  /** full copies every row each run. incremental copies only rows changed since the last run. */
+  connectorMode: "full" | "incremental";
 };
 
 export type FixtureItem = {
@@ -41,7 +43,7 @@ export type ReferenceData = {
 
 export const EDIT_ONLY_PROPERTIES = ["approvalStatus", "fulfillmentLock", "activity", "fulfillmentSync"] as const;
 
-export type ObjectType = "SalesOrder" | "SalesOrderLine" | "ShipmentLine";
+export type ObjectType = "SalesOrder" | "SalesOrderLine" | "ShipmentLine" | "FulfillmentOrder";
 
 export type SnapshotRow = {
   objectType: ObjectType;
@@ -54,6 +56,7 @@ export type SnapshotRow = {
 export const salesOrderKey = (orderNumber: string) => `sales-order:${orderNumber}`;
 export const salesOrderLineKey = (lineId: string) => `sales-order-line:${lineId}`;
 export const shipmentLineKey = (shipmentId: string) => `shipment-line:${shipmentId}`;
+export const fulfillmentOrderKey = (orderNumber: string, warehouse: string) => `fulfillment-order:${orderNumber}:${warehouse}`;
 
 export function acceleratedProfile(overrides: Partial<Profile> = {}): Profile {
   const snapshotIntervalMs = overrides.snapshotIntervalMs ?? 60_000;
@@ -71,6 +74,7 @@ export function acceleratedProfile(overrides: Partial<Profile> = {}): Profile {
     extractionMsPerRow: overrides.extractionMsPerRow ?? 0,
     indexingMsPerRow: overrides.indexingMsPerRow ?? 0,
     oracleCallsPerMinute: overrides.oracleCallsPerMinute ?? null,
+    connectorMode: overrides.connectorMode ?? "full",
   };
 }
 
@@ -235,6 +239,7 @@ export type FulfillmentOrderView = {
   status: string;
   lineCount: number;
   activeQuantity: number;
+  lastUpdateDate: number;
 };
 
 const SHIPPING_PROGRESS = ["Backordered", "Ready to Release", "Released to Warehouse", "Staged", "Shipped"];
@@ -256,8 +261,24 @@ export function fulfillmentOrders(rows: Record<string, unknown>[]): FulfillmentO
       status: active.length === 0 ? "Canceled" : SHIPPING_PROGRESS[Math.min(...positions)],
       lineCount: lines.length,
       activeQuantity: active.reduce((sum, line) => sum + Number(line.OrderedQuantity), 0),
+      lastUpdateDate: Math.max(...lines.map((line) => Number(line.LastUpdateDate) || 0)),
     };
   });
+}
+
+/** Compares what the warehouse sees, leaving out the version. */
+export function fulfillmentOrderContent(order: FulfillmentOrderView): string {
+  return JSON.stringify([order.orderNumber, order.warehouse, order.customer, order.status, order.lineCount, order.activeQuantity]);
+}
+
+/** The one way to turn a fulfillment order into a Foundry row, for the snapshot's transform and the workflow's write. */
+export function fulfillmentOrderRow(order: FulfillmentOrderView): SnapshotRow {
+  return {
+    objectType: "FulfillmentOrder",
+    objectKey: fulfillmentOrderKey(order.orderNumber, order.warehouse),
+    sourceTimestamp: order.lastUpdateDate,
+    ...presentProperties(order),
+  };
 }
 
 export function presentProperties(properties: Record<string, unknown>): { properties: Record<string, unknown>; present: string[] } {

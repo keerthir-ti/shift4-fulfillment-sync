@@ -39,8 +39,8 @@ async function measure(hooks: FlowHooks): Promise<Measured[]> {
       const approvedAt = Date.now();
       await approveOrder({ headerId: created.headerId, orderNumber: created.orderNumber }, hooks);
       for (;;) {
-        const rows = await send(`${urls.foundry}/lab/query/ShipmentLine`);
-        if (rows.body.items.some((row: { properties: { OrderNumber: string } }) => row.properties.OrderNumber === created.orderNumber)) break;
+        const rows = await send(`${urls.foundry}/lab/query/FulfillmentOrder`);
+        if (rows.body.items.some((row: { properties: { orderNumber: string } }) => row.properties.orderNumber === created.orderNumber)) break;
         if (Date.now() - approvedAt > 60_000) throw new Error(`order ${created.orderNumber} never became visible`);
         await sleep(50);
       }
@@ -74,9 +74,9 @@ const foundry = () => createHttpFoundryStore({ baseUrl: process.env.FOUNDRY_URL!
 const lazy = {
   oracle: { findOrder: (key: string) => oracle().findOrder(key), listShipmentLines: (order: string) => oracle().listShipmentLines(order) },
   foundry: {
-    writeShipmentLines: (rows: Parameters<ReturnType<typeof foundry>["writeShipmentLines"]>[0]) => foundry().writeShipmentLines(rows),
-    readShipmentLines: (order: string) => foundry().readShipmentLines(order),
-    removeShipmentLines: (lines: string[]) => foundry().removeShipmentLines(lines),
+    writeFulfillment: (data: Parameters<ReturnType<typeof foundry>["writeFulfillment"]>[0]) => foundry().writeFulfillment(data),
+    readFulfillment: (order: string) => foundry().readFulfillment(order),
+    removeFulfillment: (items: Parameters<ReturnType<typeof foundry>["removeFulfillment"]>[0]) => foundry().removeFulfillment(items),
     recordDeliveryStatus: (entry: { orderNumber: string; stage: string; message: string }) => foundry().recordDeliveryStatus(entry),
   },
 };

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { acceleratedProfile, shipmentSnapshotRow, type OracleShipment } from "../../packages/contracts/src/index.js";
+import { acceleratedProfile, shipmentSnapshotRow, type FulfillmentOrderView, type OracleShipment } from "../../packages/contracts/src/index.js";
 import { send, startStack } from "../helpers/stack.js";
 
 let stack: Awaited<ReturnType<typeof startStack>>;
@@ -104,6 +104,34 @@ describe("Foundry's edit rules", () => {
     await write([line("4001")]);
     expect((await write([line("4001", { LineStatus: "Staged" })])).body).toMatchObject({ applied: 1, skipped: 0 });
     expect((await indexed())[0].properties.LineStatus).toBe("Staged");
+  });
+});
+
+describe("fulfillment orders", () => {
+  const query = async () => (await send(`${stack.foundry.url}/lab/query/FulfillmentOrder`)).body.items as { objectKey: string; properties: Record<string, unknown> }[];
+  const view = (over: Partial<FulfillmentOrderView> = {}): FulfillmentOrderView => ({ orderNumber: "5001", warehouse: "WH-DUB", customer: "Synthetic Merchant Ltd", status: "Ready to Release", lineCount: 1, activeQuantity: 2, lastUpdateDate: 1_000, ...over });
+
+  it("don't appear from writing lines alone: the action must send them", async () => {
+    await write([line("4001")]);
+    expect(await query()).toEqual([]);
+    await send(`${stack.foundry.url}${ACTION}`, { method: "POST", body: JSON.stringify({ parameters: { rows: [], fulfillmentOrders: [view()] } }) });
+    expect((await query()).map((row) => row.objectKey)).toEqual(["fulfillment-order:5001:WH-DUB"]);
+  });
+
+  it("come from the snapshot's transform too, on the same object with no duplicate", async () => {
+    await send(`${stack.foundry.url}${ACTION}`, { method: "POST", body: JSON.stringify({ parameters: { rows: [line("4001")], fulfillmentOrders: [view()] } }) });
+    await stack.clock.advanceTo(20_000);
+    await snapshot(19_000, [line("4001"), line("4002", { OrderNumber: "5002" })]);
+    expect((await query()).map((row) => row.objectKey).sort()).toEqual(["fulfillment-order:5001:WH-DUB", "fulfillment-order:5002:WH-DUB"]);
+  });
+
+  it("stay when a later snapshot doesn't hold them, until they're removed", async () => {
+    await send(`${stack.foundry.url}${ACTION}`, { method: "POST", body: JSON.stringify({ parameters: { rows: [line("4001")], fulfillmentOrders: [view()] } }) });
+    await stack.clock.advanceTo(20_000);
+    await snapshot(19_000, []);
+    expect(await query()).toHaveLength(1);
+    await send(`${stack.foundry.url}${REMOVE}`, { method: "POST", body: JSON.stringify({ parameters: { fulfillmentOrders: [{ orderNumber: "5001", warehouse: "WH-DUB" }] } }) });
+    expect(await query()).toEqual([]);
   });
 });
 

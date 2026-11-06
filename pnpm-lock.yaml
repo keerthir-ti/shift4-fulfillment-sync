@@ -38,9 +38,6 @@ importers:
 
   apps/web:
     dependencies:
-      '@shift4/contracts':
-        specifier: workspace:*
-        version: link:../../packages/contracts
       '@shift4/order-delivery':
         specifier: workspace:*
         version: link:../../packages/order-delivery

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { fulfillmentOrders, parseTimestamp, shipmentSnapshotRow, type OracleShipment } from "../../packages/contracts/src/index.js";
-import { activeLines, compareRows, createActivities, shipmentCoverage } from "../../packages/order-delivery/src/activities.js";
+import { activeLines, compareDelivery, compareRows, createActivities, shipmentCoverage } from "../../packages/order-delivery/src/activities.js";
 import { createLogEventSink } from "../../packages/order-delivery/src/events.js";
 import { DEFAULT_DELIVERY_SETTINGS, deliverySettingsFromEnv } from "../../packages/order-delivery/src/types.js";
 
@@ -72,6 +72,31 @@ describe("compareRows", () => {
   });
 });
 
+describe("compareDelivery", () => {
+  const oracle = [row("1", "L-1", 2, { LastUpdateDate: 200 })];
+  const orderFor = (rows: OracleShipment[]) => fulfillmentOrders(rows as unknown as Record<string, unknown>[]);
+
+  it("matches only when the fulfillment order is there and right", () => {
+    expect(compareDelivery(oracle, { lines: oracle, orders: orderFor(oracle) }).inSync).toBe(true);
+    expect(compareDelivery(oracle, { lines: oracle, orders: [] })).toMatchObject({ inSync: false, differences: { orders: 1 }, toWrite: [] });
+    expect(compareDelivery(oracle, { lines: oracle, orders: [{ ...orderFor(oracle)[0], status: "Shipped" }] })).toMatchObject({ inSync: false, differences: { orders: 1 } });
+  });
+
+  it("removes a fulfillment order for a warehouse no line ships from any more", () => {
+    const stale = { ...orderFor(oracle)[0], warehouse: "WH-EAST" };
+    expect(compareDelivery(oracle, { lines: oracle, orders: [...orderFor(oracle), stale] }).ordersToRemove).toEqual([{ orderNumber: "5001", warehouse: "WH-EAST" }]);
+  });
+
+  it("builds the fulfillment order from a newer Foundry line, so it isn't undone", () => {
+    const newer = [row("1", "L-1", 2, { LastUpdateDate: 300, LineStatus: "Staged" })];
+    expect(compareDelivery(oracle, { lines: newer, orders: orderFor(newer) }).inSync).toBe(true);
+  });
+
+  it("changes nothing on an empty Oracle answer", () => {
+    expect(compareDelivery([], { lines: oracle, orders: orderFor(oracle) })).toMatchObject({ toRemove: [], ordersToRemove: [], ordersToWrite: [] });
+  });
+});
+
 describe("removing rows", () => {
   it("never deletes on an empty Oracle answer, because a retry couldn't undo it", () => {
     const held = row("1", "L-1", 1);
@@ -86,7 +111,8 @@ describe("sweep", () => {
       oracle: unused,
       foundry: unused,
       recovery: {
-        index: { listOrdersNeedingDelivery: async () => ["good", "bad", "also-good"] },
+        index: { listOrdersNeedingDelivery: async () => ["good", "bad", "also-good"], listDeliveredOrders: async () => [] },
+        recheck: async () => "rechecking",
         start: async (key) => {
           if (key === "bad") throw new Error("Temporal said no");
           return "started";
@@ -118,8 +144,8 @@ describe("fulfillmentOrders", () => {
       properties(row("3", "L-3", 1, { RequestedFulfillmentOrganizationCode: "WH-EAST", LineStatus: "Shipped" })),
     ]);
     expect(orders).toEqual([
-      { orderNumber: "5001", warehouse: "WH-DUB", customer: "Synthetic Merchant Ltd", status: "Ready to Release", lineCount: 2, activeQuantity: 3 },
-      { orderNumber: "5001", warehouse: "WH-EAST", customer: "Synthetic Merchant Ltd", status: "Shipped", lineCount: 1, activeQuantity: 1 },
+      { orderNumber: "5001", warehouse: "WH-DUB", customer: "Synthetic Merchant Ltd", status: "Ready to Release", lineCount: 2, activeQuantity: 3, lastUpdateDate: 100 },
+      { orderNumber: "5001", warehouse: "WH-EAST", customer: "Synthetic Merchant Ltd", status: "Shipped", lineCount: 1, activeQuantity: 1, lastUpdateDate: 100 },
     ]);
   });
 

@@ -3,7 +3,7 @@
  * helpers, and the workflow and activities only see these interfaces. RecoveryIndex and
  * DeliveryEventSink are optional. The HTTP implementations below talk to the local simulators.
  */
-import { parseTimestamp, type OracleShipment } from "@shift4/contracts";
+import { parseTimestamp, type FulfillmentOrderView, type OracleShipment } from "@shift4/contracts";
 
 export class SystemHttpError extends Error {
   constructor(
@@ -33,13 +33,16 @@ export interface OracleOrderReader {
   listShipmentLines(orderNumber: string): Promise<OracleShipment[]>;
 }
 
+/** The objects Fulfillment Manager depends on for one order. */
+export type FulfillmentData = { lines: OracleShipment[]; orders: FulfillmentOrderView[] };
+
 export interface FoundryFulfillmentStore {
-  /** Writes every snapshot-owned field. Rows Foundry already holds unchanged, or newer, are skipped. */
-  writeShipmentLines(rows: OracleShipment[]): Promise<{ applied: number; skipped: number }>;
-  /** What Foundry holds now for one order. LastUpdateDate in epoch ms. */
-  readShipmentLines(orderNumber: string): Promise<OracleShipment[]>;
-  /** Removes rows Oracle no longer has, because an object created by an Action outlives its source row. */
-  removeShipmentLines(shipmentLines: string[]): Promise<void>;
+  /** Writes every snapshot-owned field. Lines Foundry already holds unchanged, or newer, are skipped. */
+  writeFulfillment(data: FulfillmentData): Promise<{ applied: number; skipped: number }>;
+  /** What Foundry holds now for one order. Timestamps in epoch ms. */
+  readFulfillment(orderNumber: string): Promise<FulfillmentData>;
+  /** Removes objects Oracle no longer supports, because an object created by an Action outlives its source row. */
+  removeFulfillment(items: { lines: string[]; orders: { orderNumber: string; warehouse: string }[] }): Promise<void>;
   recordDeliveryStatus(entry: { orderNumber: string; stage: string; message: string }): Promise<void>;
 }
 
@@ -47,6 +50,8 @@ export interface FoundryFulfillmentStore {
 export interface RecoveryIndex {
   /** Source numbers of recent submitted orders with no final delivery status, newest first. */
   listOrdersNeedingDelivery(query: { since: number; limit: number }): Promise<string[]>;
+  /** Source numbers of recent orders recorded as delivered, newest first, for the delivery audit. */
+  listDeliveredOrders(query: { since: number; limit: number }): Promise<string[]>;
 }
 
 export type DeliveryEvent = { orderKey: string; orderNumber?: string; stage: string; message: string; at: string };
@@ -132,16 +137,22 @@ function foundryApi(options: HttpOptions & { ontology?: string }) {
 export function createHttpFoundryStore(options: HttpOptions & { ontology?: string }): FoundryFulfillmentStore {
   const api = foundryApi(options);
   return {
-    async writeShipmentLines(rows) {
-      const result = await api.applyAction<{ applied: number; skipped: number }>("sync-shipment-lines", { rows });
+    async writeFulfillment({ lines, orders }) {
+      const result = await api.applyAction<{ applied: number; skipped: number }>("sync-shipment-lines", { rows: lines, fulfillmentOrders: orders });
       return { applied: result.applied, skipped: result.skipped };
     },
-    async readShipmentLines(orderNumber) {
-      const objects = await api.search("ShipmentLine", { type: "eq", field: "OrderNumber", value: orderNumber });
-      return objects.map(({ __primaryKey: _key, ...row }) => ({ ...row, LastUpdateDate: parseTimestamp(row.LastUpdateDate) }) as unknown as OracleShipment);
+    async readFulfillment(orderNumber) {
+      const [lines, orders] = await Promise.all([
+        api.search("ShipmentLine", { type: "eq", field: "OrderNumber", value: orderNumber }),
+        api.search("FulfillmentOrder", { type: "eq", field: "orderNumber", value: orderNumber }),
+      ]);
+      return {
+        lines: lines.map(({ __primaryKey: _key, ...row }) => ({ ...row, LastUpdateDate: parseTimestamp(row.LastUpdateDate) }) as unknown as OracleShipment),
+        orders: orders.map(({ __primaryKey: _key, ...row }) => ({ ...row, lastUpdateDate: parseTimestamp(row.lastUpdateDate) }) as unknown as FulfillmentOrderView),
+      };
     },
-    async removeShipmentLines(shipmentLines) {
-      await api.applyAction("remove-shipment-lines", { shipmentLines });
+    async removeFulfillment({ lines, orders }) {
+      await api.applyAction("remove-shipment-lines", { shipmentLines: lines, fulfillmentOrders: orders });
     },
     async recordDeliveryStatus(entry) {
       await api.applyAction("record-fulfillment-sync", entry);
@@ -153,21 +164,23 @@ const FINAL_STAGES = new Set(["DeliveryVerified", "CanceledInOracle", "OperatorS
 
 export function createHttpRecoveryIndex(options: HttpOptions & { ontology?: string }): RecoveryIndex {
   const api = foundryApi(options);
+  const recentOrders = async (since: number, matches: (stage: string) => boolean, limit: number) => {
+    const orders = await api.search("SalesOrder", {
+      type: "and",
+      value: [
+        { type: "eq", field: "submittedFlag", value: true },
+        { type: "gte", field: "lastUpdateDate", value: since },
+      ],
+    });
+    return orders
+      .filter((order) => matches(String((order.fulfillmentSync as { stage?: string } | undefined)?.stage)))
+      .sort((a, b) => Number(b.lastUpdateDate) - Number(a.lastUpdateDate))
+      .map((order) => order.sourceTransactionNumber)
+      .filter((key): key is string => typeof key === "string" && key.length > 0)
+      .slice(0, limit);
+  };
   return {
-    async listOrdersNeedingDelivery({ since, limit }) {
-      const orders = await api.search("SalesOrder", {
-        type: "and",
-        value: [
-          { type: "eq", field: "submittedFlag", value: true },
-          { type: "gte", field: "lastUpdateDate", value: since },
-        ],
-      });
-      return orders
-        .filter((order) => !FINAL_STAGES.has(String((order.fulfillmentSync as { stage?: string } | undefined)?.stage)))
-        .sort((a, b) => Number(b.lastUpdateDate) - Number(a.lastUpdateDate))
-        .map((order) => order.sourceTransactionNumber)
-        .filter((key): key is string => typeof key === "string" && key.length > 0)
-        .slice(0, limit);
-    },
+    listOrdersNeedingDelivery: ({ since, limit }) => recentOrders(since, (stage) => !FINAL_STAGES.has(stage), limit),
+    listDeliveredOrders: ({ since, limit }) => recentOrders(since, (stage) => stage === "DeliveryVerified", limit),
   };
 }

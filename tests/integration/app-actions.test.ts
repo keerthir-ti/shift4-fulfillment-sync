@@ -35,10 +35,10 @@ describe("web actions", () => {
     const approved = await approveOrder({ headerId: created.headerId, orderNumber: created.orderNumber });
     expect(approved.ok).toBe(true);
     const fulfillment = await readFulfillment();
-    expect(fulfillment.items).toEqual([]);
+    expect(fulfillment.orders).toEqual([]);
     expect(stack.oracle.ctx.requests.some((request) => request.url.includes("shipmentLines"))).toBe(false);
     expect(traces().some((trace) => trace.target === "oracle" && trace.url.includes("shipmentLines"))).toBe(false);
-    expect(traces().filter((trace) => trace.target === "foundry" && trace.url.includes("ShipmentLine"))).toHaveLength(1);
+    expect(traces().filter((trace) => trace.target === "foundry" && trace.url.includes("FulfillmentOrder"))).toHaveLength(1);
     const uncertain = await send(`${stack.oracle.url}/lab/faults`, { method: "POST", body: JSON.stringify({ mode: "lose-response" }) });
     expect(uncertain.status).toBe(200);
     const lost = await createOrder({

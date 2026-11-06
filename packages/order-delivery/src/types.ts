@@ -67,7 +67,7 @@ export function deliverySettingsFromEnv(env: Record<string, string | undefined> 
   };
 }
 
-export type DeliveryTrigger = "approved" | "uncertain" | "recovery" | "oracle-event";
+export type DeliveryTrigger = "approved" | "uncertain" | "recovery" | "audit" | "check-now";
 
 export type OrderDeliveryInput = {
   /** SourceTransactionNumber: known before any Oracle call. */
@@ -92,6 +92,8 @@ export type RowDifferences = {
   older: number;
   changed: number;
   extra: number;
+  /** Fulfillment orders to create, correct or remove. */
+  orders: number;
 };
 
 /** One pass's result. Counts only, so customer rows never enter workflow history. */
@@ -111,6 +113,17 @@ export type DeliveryResult = {
   wentOverdue: boolean;
   reason?: string;
   stages: DeliveryStage[];
+  /** Where the time went, which measures Oracle's real processing time on a real system. */
+  timings: DeliveryTimings;
+};
+
+export type DeliveryTimings = {
+  /** Start until Oracle's lines covered the order. */
+  awaitingOracleMs?: number;
+  /** Coverage until the first pass that found both systems matching. */
+  reconcilingMs?: number;
+  /** Start until delivery was verified, or until the workflow ended without it. */
+  totalMs: number;
 };
 
 export type DeliveryProgress = {
@@ -126,5 +139,7 @@ export type RecoveryInput = {
   limit: number;
   settings: DeliverySettings;
 };
+
+export type AuditResult = { checked: number; rechecking: number; running: number; failed: number };
 
 export type RecoveryResult = { checked: number; started: number; running: number; stopped: number; capped: number; failed: number };

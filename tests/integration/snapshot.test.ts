@@ -27,6 +27,22 @@ async function submitAccessory(at: number, source: string, quantity = 2) {
   return created.body.OrderNumber as string;
 }
 
+describe("incremental snapshots", () => {
+  it("copy only changed rows, keep the others, and build the fulfillment order from all of them", async () => {
+    stack = await startStack({ profile: acceleratedProfile({ oracleProcessingMs: 100, extractionMs: 100, indexingMs: 100, snapshotIntervalMs: 1_000, connectorMode: "incremental" }) });
+    await stack.clock.advanceTo(0);
+    const first = await submitAccessory(0, "first-order");
+    await stack.clock.advanceTo(1_300);
+    const second = await submitAccessory(1_300, "second-order");
+    await stack.clock.advanceTo(3_300);
+    const query = async (type: string) => (await send(`${stack.foundry.url}/lab/query/${type}`)).body.items as { properties: Record<string, unknown> }[];
+    expect((await query("ShipmentLine")).map((row) => row.properties.OrderNumber).sort()).toEqual([first, second].sort());
+    expect((await query("FulfillmentOrder")).map((row) => row.properties.orderNumber).sort()).toEqual([first, second].sort());
+    const counts = stack.connector.ctx.events.all().filter((event) => event.eventType === "connector.capture.frozen" && event.detail?.kind === "shipment-lines" && (event.detail?.capturedAt as number) > 1_000).map((event) => event.detail?.count as number);
+    expect(Math.max(...counts)).toBe(1);
+  });
+});
+
 describe("scheduled snapshots", () => {
   it("keeps a capture empty when oracle becomes ready during ingestion", async () => {
     stack = await startStack({
