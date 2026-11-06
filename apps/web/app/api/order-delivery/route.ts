@@ -11,13 +11,17 @@ export async function GET(request: Request) {
   const orderKey = new URL(request.url).searchParams.get("orderKey");
   if (!orderKey) return NextResponse.json({ message: "orderKey is required" }, { status: 400 });
   const client = process.env.FULFILLMENT_SYNC === "on" ? await sharedClient().catch(() => undefined) : undefined;
-  const explanation = await explainOrderDelivery({
-    orderKey,
-    oracle: createHttpOracleReader({ baseUrl: oracleUrl("") }),
-    foundry: createHttpFoundryStore({ baseUrl: foundryUrl("") }),
-    client,
-  });
-  return NextResponse.json(explanation, { headers: { "cache-control": "no-store" } });
+  try {
+    const explanation = await explainOrderDelivery({
+      orderKey,
+      oracle: createHttpOracleReader({ baseUrl: oracleUrl("") }),
+      foundry: createHttpFoundryStore({ baseUrl: foundryUrl("") }),
+      client,
+    });
+    return NextResponse.json(explanation, { headers: { "cache-control": "no-store" } });
+  } catch (error) {
+    return NextResponse.json({ message: `Oracle or Foundry couldn't be read: ${error instanceof Error ? error.message : "unknown error"}` }, { status: 502 });
+  }
 }
 
 /** Asks an order's workflow to check now, or starts one if there isn't one. Oracle's event integration calls this too. */
@@ -25,7 +29,10 @@ export async function POST(request: Request) {
   const { orderKey } = (await request.json().catch(() => ({}))) as { orderKey?: string };
   if (!orderKey) return NextResponse.json({ message: "orderKey is required" }, { status: 400 });
   if (process.env.FULFILLMENT_SYNC !== "on") return NextResponse.json({ message: "The workflow is off" }, { status: 409 });
-  const client = await sharedClient();
-  await requestCheckNow(client, { orderKey, settings: deliverySettingsFromEnv() }, process.env.TEMPORAL_TASK_QUEUE ?? "order-delivery");
-  return NextResponse.json({ ok: true, orderKey });
+  try {
+    await requestCheckNow(await sharedClient(), { orderKey, settings: deliverySettingsFromEnv() }, process.env.TEMPORAL_TASK_QUEUE ?? "order-delivery");
+    return NextResponse.json({ ok: true, orderKey });
+  } catch (error) {
+    return NextResponse.json({ message: `Temporal couldn't be reached: ${error instanceof Error ? error.message : "unknown error"}` }, { status: 503 });
+  }
 }

@@ -58,6 +58,7 @@ export function requestCheckNow(client: Client, input: { orderKey: string; setti
     workflowIdConflictPolicy: "USE_EXISTING",
     workflowIdReusePolicy: "ALLOW_DUPLICATE",
     typedSearchAttributes: searchAttributesFor(input.orderKey),
+    staticSummary: `Deliver order ${input.orderKey} to Fulfillment Manager`,
   });
 }
 
@@ -89,7 +90,7 @@ export async function describeOrderDelivery(client: Client, orderKey: string): P
   }
 }
 
-/** What the sweep uses to start a missed order. It leaves a running workflow alone, and stops retrying after maxRuns. */
+/** What the sweep uses to start a missed order. It leaves a running workflow alone, and stops retrying after maxRuns failed runs. */
 export function createRecoveryStarter(client: Client, taskQueue: string, settings: DeliverySettings, maxRuns = 5) {
   return {
     async start(orderKey: string): Promise<"started" | "running" | "stopped" | "capped"> {
@@ -97,9 +98,11 @@ export function createRecoveryStarter(client: Client, taskQueue: string, setting
       if (current?.status === "RUNNING") return "running";
       // An operator stopped it on purpose, maybe before any status could be saved on the order.
       if (current?.status === "CANCELLED" || current?.status === "TERMINATED") return "stopped";
-      let runs = 0;
-      for await (const _run of client.workflow.list({ query: `WorkflowId = "${workflowIdFor(orderKey).replace(/["\\]/g, "\\$&")}"` })) runs += 1;
-      if (runs >= maxRuns) return "capped";
+      // Only failed runs count, so audits of a healthy order never use up its retries.
+      let failedRuns = 0;
+      const workflowId = workflowIdFor(orderKey).replace(/["\\]/g, "\\$&");
+      for await (const _run of client.workflow.list({ query: `WorkflowId = "${workflowId}" AND DeliveryStage = "ActionRequired"` })) failedRuns += 1;
+      if (failedRuns >= maxRuns) return "capped";
       await startOrderDelivery(client, { orderKey, trigger: "recovery", settings }, taskQueue, { priorityKey: RECOVERY_PRIORITY });
       return "started";
     },

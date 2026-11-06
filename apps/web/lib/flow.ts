@@ -13,7 +13,7 @@ export type CreateOrderInput = {
 
 export type FlowResult =
   | { ok: true; orderNumber: string; headerId: string; sourceTransactionNumber: string; outcome: string }
-  | { ok: false; outcome: "uncertain" | "validation" | "busy"; message: string; sourceTransactionNumber?: string; status?: number };
+  | { ok: false; outcome: "uncertain" | "validation" | "busy" | "unavailable"; message: string; sourceTransactionNumber?: string; status?: number };
 
 /** The approve flow's one extension point. The app works the same with no hooks. */
 export type FlowHooks = {
@@ -77,9 +77,11 @@ export async function createOrder(input: CreateOrderInput): Promise<FlowResult> 
 export async function approveOrder(input: { headerId: string; orderNumber: string }, hooks?: FlowHooks): Promise<FlowResult> {
   const flowHooks = hooks ?? (await configuredHooks());
   const current = await callService("oracle", oracleUrl(`${PREFIX}/salesOrders/${input.headerId}`));
+  if (current.status === 429) return oracleBusy(input.orderNumber);
   if (current.status >= 400) return { ok: false, outcome: "validation", message: current.body.message ?? "Order not found", status: current.status };
   const submitHref = current.body.links.find((link: { rel: string }) => link.rel === "submit").href as string;
   const lines = await callService("oracle", current.body.links.find((link: { rel: string }) => link.rel === "lines").href as string);
+  if (lines.status === 429) return oracleBusy(input.orderNumber);
   if (lines.status >= 400) return { ok: false, outcome: "validation", message: lines.body.message ?? "Order lines could not be read", status: lines.status };
   // A network error or a hang is the same as a lost response: Oracle may have accepted the submit.
   const submitted = await callService("oracle", submitHref, {

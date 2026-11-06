@@ -229,8 +229,9 @@ async function runCapture(ctx: ConnectorContext, kind: SnapshotKind, capturedAt:
         return release();
       }
       const commit = async () => {
-        await commitSnapshot({ id: captured.id, foundryUrl: ctx.foundryUrl, store: ctx.store, events: ctx.events, immediate: initialLoad, append: incremental });
-        if (kind === "shipment-lines") ctx.lastShipmentCaptureAt = capturedAt;
+        const committed = await commitSnapshot({ id: captured.id, foundryUrl: ctx.foundryUrl, store: ctx.store, events: ctx.events, immediate: initialLoad, append: incremental });
+        // A failed commit leaves the marker alone, so the next incremental run still covers these rows.
+        if (committed.ok && kind === "shipment-lines") ctx.lastShipmentCaptureAt = capturedAt;
         await release();
       };
       onResult?.({ ok: true, id: captured.id });

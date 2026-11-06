@@ -43,6 +43,30 @@ describe("incremental snapshots", () => {
   });
 });
 
+describe("failed incremental commit", () => {
+  it("doesn't lose rows: the next run copies them again", async () => {
+    stack = await startStack({ profile: acceleratedProfile({ oracleProcessingMs: 100, extractionMs: 100, indexingMs: 100, snapshotIntervalMs: 1_000, connectorMode: "incremental" }) });
+    const orderNumber = await submitAccessory(0, "survives-failed-commit");
+    const realFetch = globalThis.fetch;
+    let failures = 0;
+    globalThis.fetch = async (url, init) => {
+      if (failures === 0 && init?.method === "POST" && String(url).endsWith("/lab/backing-generations") && String(init.body).includes(orderNumber)) {
+        failures += 1;
+        return new Response("{}", { status: 500 });
+      }
+      return realFetch(url, init);
+    };
+    try {
+      await stack.clock.advanceTo(3_500);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    expect(failures).toBe(1);
+    const lines = (await send(`${stack.foundry.url}/lab/query/ShipmentLine`)).body.items as { properties: { OrderNumber: string } }[];
+    expect(lines.map((row) => row.properties.OrderNumber)).toContain(orderNumber);
+  });
+});
+
 describe("scheduled snapshots", () => {
   it("keeps a capture empty when oracle becomes ready during ingestion", async () => {
     stack = await startStack({

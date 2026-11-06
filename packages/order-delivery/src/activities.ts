@@ -2,7 +2,7 @@ import { Context } from "@temporalio/activity";
 import { ApplicationFailure } from "@temporalio/common";
 import { coverage, fulfillmentOrderContent, fulfillmentOrders, shipmentContent, type FulfillmentOrderView, type OracleShipment } from "@shift4/contracts";
 import { SystemHttpError, type DeliveryEventSink, type FoundryFulfillmentStore, type FulfillmentData, type OracleOrderReader, type OracleOrderView, type RecoveryIndex } from "./system-adapters";
-import type { AuditResult, CoverageResult, OrderLine, OrderReference, ReconcileResult, RecoveryResult, RowDifferences } from "./types";
+import type { AuditResult, OrderLine, OrderReadiness, OrderReference, ReconcileResult, RecoveryResult, RowDifferences } from "./types";
 
 export type ActivityDeps = {
   oracle: OracleOrderReader;
@@ -126,26 +126,29 @@ const coverageMessage = (state: { found: number; expected: number }) => `found q
 
 export function createActivities(deps: ActivityDeps) {
   return {
-    /** Retries until Oracle has the order and it is submitted. This covers a lost response. */
-    async findSubmittedOrder({ orderKey }: { orderKey: string }): Promise<OrderReference> {
-      const order = await guarded(() => deps.oracle.findOrder(orderKey));
-      if (!order) throw notYet("OrderNotInOracleYet", `Oracle has no order ${orderKey} yet`);
-      if (!order.submitted && !isCanceled(order.status)) throw notYet("OrderNotSubmittedYet", `Order ${order.orderNumber} is not submitted in Oracle`);
-      return { orderKey, orderNumber: order.orderNumber, lines: activeLines(order) };
-    },
-
-    /** One poll, normally one Oracle read. Fails with a retryable error, which is how polling happens. */
-    async checkShipmentCoverage({ order, refreshEvery }: { order: OrderReference; refreshEvery: number }): Promise<CoverageResult> {
+    /**
+     * One check of how far Oracle has got, normally one read. Without an order it looks for the submitted
+     * order, which covers a lost response. With one it checks shipment lines. It fails with a retryable
+     * error until the next milestone, which is how polling happens.
+     */
+    async checkOrderReady({ orderKey, order, refreshEvery = 0 }: { orderKey: string; order?: OrderReference; refreshEvery?: number }): Promise<OrderReadiness> {
+      if (!order) {
+        const current = await guarded(() => deps.oracle.findOrder(orderKey));
+        if (!current) throw notYet("OrderNotInOracleYet", `Oracle has no order ${orderKey} yet`);
+        if (!current.submitted && !isCanceled(current.status)) throw notYet("OrderNotSubmittedYet", `Order ${current.orderNumber} is not submitted in Oracle`);
+        const lines = activeLines(current);
+        return { status: lines.length === 0 ? "canceled" : "found", order: { orderKey, orderNumber: current.orderNumber, lines } };
+      }
       let lines = order.lines;
       if (refreshEvery > 0 && Context.current().info.attempt % refreshEvery === 0) {
-        const fresh = await guarded(() => deps.oracle.findOrder(order.orderKey));
+        const fresh = await guarded(() => deps.oracle.findOrder(orderKey));
         if (fresh) lines = activeLines(fresh);
-        if (lines.length === 0) return { status: "canceled", lines };
+        if (lines.length === 0) return { status: "canceled", order: { ...order, lines } };
       }
       const rows = await guarded(() => deps.oracle.listShipmentLines(order.orderNumber));
       const state = shipmentCoverage(lines, rows);
       if (!state.covered) throw notYet("ShipmentCoverageIncomplete", coverageMessage(state));
-      return { status: "covered", lines };
+      return { status: "covered", order: { ...order, lines } };
     },
 
     /**
@@ -170,7 +173,8 @@ export function createActivities(deps: ActivityDeps) {
 
     /** For people and audit. A failure here never changes the delivery result. */
     async recordDeliveryStatus(entry: { orderKey: string; orderNumber?: string; stage: string; message: string }): Promise<void> {
-      await deps.events?.record({ ...entry, at: new Date().toISOString() }).catch(() => undefined);
+      // Only the first attempt sends the event, so a Foundry retry can't repeat an alert.
+      if (Context.current().info.attempt === 1) await deps.events?.record({ ...entry, at: new Date().toISOString() }).catch(() => undefined);
       const { orderNumber } = entry;
       if (orderNumber) await guarded(() => deps.foundry.recordDeliveryStatus({ orderNumber, stage: entry.stage, message: entry.message }));
     },

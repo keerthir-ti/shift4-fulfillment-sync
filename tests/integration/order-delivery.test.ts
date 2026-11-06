@@ -369,8 +369,7 @@ describe("recovery sweep", () => {
       await result(delivered.orderKey);
       const failing = await draft();
       await approveOrder(failing, hooksFor(taskQueue, fast({ deadlineMs: 100 })));
-      await sim(`${stack.oracle.url}/lab/orders/${failing.headerId}/cancel`, {}).catch(() => undefined);
-      await result(failing.orderKey).catch(() => undefined);
+      expect(await result(failing.orderKey)).toMatchObject({ status: "ActionRequired" });
       await sleep(1_500);
       const index = createHttpRecoveryIndex({ baseUrl: stack.foundry.url });
       expect(await index.listOrdersNeedingDelivery({ since: 0, limit: 10 })).not.toContain(delivered.orderKey);
@@ -820,6 +819,20 @@ describe("failures", () => {
       expect(final.reason).toContain("usable timestamp");
     });
     expect(reads).toBe(1);
+  });
+
+  it("reports an unreachable system as a message, rather than crashing the action", async () => {
+    const order = await draft();
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => {
+      throw new TypeError("fetch failed");
+    };
+    try {
+      const { approveOrderAction } = await import("../../apps/web/app/actions.js");
+      expect(await approveOrderAction(order)).toMatchObject({ ok: false, outcome: "unavailable" });
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 
   it("tells the user Oracle is busy on a 429, and doesn't start a workflow", async () => {
