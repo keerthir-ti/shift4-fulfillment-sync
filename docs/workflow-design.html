@@ -124,11 +124,21 @@
 </tbody>
 </table>
 <p>Measured through the real app flow, on the same simulators and settings. Oracle processing (90 seconds), snapshot costs and the 120 calls per minute limit are assumptions, so these show how each option behaves and aren't Shift4 measurements.</p>
-<!--ALTERNATIVES-->
+<table>
+<thead><tr><th>Path</th><th>Slowest, no existing lines</th><th>Slowest, 25,000 lines</th><th>Slowest, 100,000 lines</th><th>Connector calls per hour at 100,000</th></tr></thead>
+<tbody>
+<tr><td>Snapshot every 15 min</td><td>17.5 min</td><td>18.8 min</td><td>22.3 min</td><td>673</td></tr>
+<tr><td>Snapshot every 5 min</td><td>7.5 min</td><td>8.8 min</td><td>12.3 min</td><td>2,152</td></tr>
+<tr><td>Snapshot every 1 min</td><td>3.5 min</td><td>4.8 min</td><td>8.3 min</td><td>6,816</td></tr>
+<tr><td>Incremental every 5 min</td><td>7.5 min</td><td>7.5 min</td><td>7.5 min</td><td>11</td></tr>
+<tr><td><strong>This workflow</strong></td><td>Not measured</td><td><strong>1.8 min</strong></td><td>Not measured</td><td>8 calls for that order</td></tr>
+</tbody>
+</table>
+<p>A faster snapshot cuts the wait but multiplies load on the shared Oracle limit, and still slows with data. An incremental connector stays flat and cheap, which makes it a good partner for the snapshot, but every order still waits for a schedule and gets no status of its own. The snapshot rows use simulated time, and the workflow row used real time with a real Temporal server, once at 25,000 lines.</p>
 
 <h2>3. Workflow design</h2>
 <h3><code>deliverOrderToFulfillment</code>: one per approved order</h3>
-<p>The approve action submits to Oracle, starts this workflow, then mirrors to Foundry, so a mirror failure can't hold the order back. The workflow contains control flow only, and all I/O happens in activities. Its ID, <code>order-delivery:&lt;SourceTransactionNumber&gt;</code>, is known before any Oracle call, so a lost response can't lose the order. <code>USE_EXISTING</code> makes a double click join the running workflow. <code>ALLOW_DUPLICATE</code> lets the sweep or a retry start again after a run has closed.</p>
+<p>The approve action submits to Oracle, starts this workflow, then mirrors to Foundry, so a mirror failure can't hold the order back. The workflow file holds only the delivery path, with its Temporal plumbing in a separate runtime file, and all I/O happens in activities. Its ID, <code>order-delivery:&lt;SourceTransactionNumber&gt;</code>, is known before any Oracle call, so a lost response can't lose the order. <code>USE_EXISTING</code> makes a double click join the running workflow. <code>ALLOW_DUPLICATE</code> lets the sweep or a retry start again after a run has closed.</p>
 <figure>
 <svg viewBox="0 0 720 205" role="img" aria-label="Workflow stages">
   <rect class="new" x="10" y="35" width="130" height="46" rx="6"/><text class="t" x="75" y="54">Awaiting</text><text class="t" x="75" y="70">SubmittedOrder</text>
@@ -150,14 +160,14 @@
 </figure>
 
 <h3>Activities</h3>
+<p>The first three are the required core. The sweep and audit are optional.</p>
 <table>
 <thead><tr><th style="width:21%">Activity</th><th style="width:38%">What it does</th><th style="width:20%">Uses</th><th>Queue and retry</th></tr></thead>
 <tbody>
-<tr><td><code>findSubmittedOrder</code></td><td>Reads the order by source number. Fails until Oracle returns it as submitted, which covers a lost submit response. Returns its number and active lines.</td><td>Oracle: <code>findOrder</code></td><td><code>oracle-reads</code>. Polling, until the deadline</td></tr>
-<tr><td><code>checkShipmentCoverage</code></td><td>One check per attempt. Fails until active shipment lines cover every ordered quantity, across all pages and warehouses. Every fifth attempt it re-reads the order to notice a cancellation.</td><td>Oracle: <code>listShipmentLines</code>, sometimes <code>findOrder</code></td><td><code>oracle-reads</code>. Polling, sharing the same deadline</td></tr>
+<tr><td><code>checkOrderReady</code></td><td>One check of how far Oracle has got. First it fails until Oracle returns the order as submitted, which covers a lost response. Then it fails until active shipment lines cover every quantity, across all pages and warehouses, re-reading the order every fifth attempt to notice a cancellation.</td><td>Oracle: <code>findOrder</code>, <code>listShipmentLines</code></td><td><code>oracle-reads</code>. Polling, until the deadline</td></tr>
 <tr><td><code>reconcileOrder</code></td><td>The core. Reads the order, Oracle's lines and Foundry's objects, builds the expected fulfillment orders, writes what's missing, older or changed, and removes what Oracle no longer supports. Returns only counts.</td><td>Oracle: both reads. Foundry: read, <code>sync-shipment-lines</code>, <code>remove-shipment-lines</code></td><td><code>oracle-reads</code>. 30-minute window</td></tr>
 <tr><td><code>recordDeliveryStatus</code></td><td>Sends an audit or alert event, and saves the stage on the sales order. A failure here never changes the result.</td><td>Event sink. Foundry: <code>record-fulfillment-sync</code></td><td><code>order-delivery</code>. 3 attempts</td></tr>
-<tr><td><code>sweepMissedOrders</code></td><td>Starts recent submitted orders with no final status. Skips running and stopped ones, and stops after 5 runs per order.</td><td>Recovery index. Temporal client</td><td><code>order-delivery</code>. 3 attempts</td></tr>
+<tr><td><code>sweepMissedOrders</code></td><td>Starts recent submitted orders with no final status. Skips running and stopped ones, and stops after 5 failed runs per order.</td><td>Recovery index. Temporal client</td><td><code>order-delivery</code>. 3 attempts</td></tr>
 </tbody>
 </table>
 
@@ -202,7 +212,7 @@
 <tr><td>Expired credentials</td><td>Keeps retrying, and recovers once they're fixed.</td></tr>
 <tr><td>A bad date or programming error</td><td>Stops at once with the reason, rather than looking like a long wait.</td></tr>
 <tr><td>Lines never appear</td><td>Overdue at 30 minutes, then ActionRequired at 4 hours, with the reason recorded.</td></tr>
-<tr><td>An order keeps failing</td><td>The sweep stops restarting it after 5 runs, and never restarts a delivered or stopped order. One order that can't start doesn't affect the others.</td></tr>
+<tr><td>An order keeps failing</td><td>The sweep stops restarting it after 5 failed runs, and never restarts a delivered or stopped order. One order that can't start doesn't affect the others.</td></tr>
 <tr><td>Oracle changes after delivery</td><td>Caught by the settle watch soon after delivery, then by the snapshot or daily audit.</td></tr>
 </tbody>
 </table>
@@ -212,9 +222,9 @@
 <table>
 <thead><tr><th style="width:32%">Benefit</th><th>Why it matters</th></tr></thead>
 <tbody>
-<tr><td><strong>No wait for a schedule</strong></td><td>The order appears soon after Oracle creates its lines. With the same containers and settings, approve to visible went from 64.1 seconds to 8.9 seconds, which is Oracle's 5 seconds plus the wait for the next check.</td></tr>
+<tr><td><strong>No wait for a schedule</strong></td><td>The order appears soon after Oracle creates its lines. With the same containers and settings, approve to visible went from 64.1 seconds to 7.9 seconds, which is Oracle's 5 seconds plus the wait for the next check.</td></tr>
 <tr><td><strong>Timing no longer depends on luck</strong></td><td>On the simulators, the wait varied from 5.5 to 20.5 seconds with the moment of approval today, and stayed at 2.1–2.2 seconds with the workflow.</td></tr>
-<tr><td><strong>Cost follows the order, not the table</strong></td><td>Each read covers one order, so this path doesn't slow down as data grows.</td></tr>
+<tr><td><strong>Cost follows the order, not the table</strong></td><td>Each read covers one order, so this path doesn't depend on table size. It used 8 Oracle calls for its order at 25,000 lines.</td></tr>
 <tr><td><strong>One simple, repeatable core</strong></td><td>Retries, restarts, late changes and verification all go through one comparison, and repeating it is always safe.</td></tr>
 <tr><td><strong>Every order has an answer</strong></td><td>Each ends with a known status and reason, overdue orders raise an event, and <code>make explain</code> answers from live data with no manual check in Oracle.</td></tr>
 <tr><td><strong>Delivered means the warehouse can see it</strong></td><td>The status is set only when a pass finds the lines and the fulfillment order match, and the settle watch checks once more.</td></tr>

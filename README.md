@@ -27,8 +27,8 @@ approveOrder (apps/web/lib/flow.ts)
   mirror the order to Foundry
 
 deliverOrderToFulfillment
-  AwaitingSubmittedOrder     findSubmittedOrder      order exists and is submitted
-  AwaitingShipmentCoverage   checkShipmentCoverage   lines cover every ordered quantity
+  AwaitingSubmittedOrder     checkOrderReady         order exists and is submitted
+  AwaitingShipmentCoverage   checkOrderReady         lines cover every ordered quantity
   Reconciling                reconcileOrder          compare both systems, write only differences
                                                      repeat until a pass finds nothing to change
   DeliveryVerified           recordDeliveryStatus    then one more check after the settle watch
@@ -83,7 +83,7 @@ Work started by the sweep or audit runs at a lower Temporal priority than new ap
 
 ## Workflow
 
-`workflows.ts` contains decisions only, and every outside call happens in an activity. History holds identifiers, quantities and counts, and customer rows stay inside the activities.
+`workflows.ts` holds only the delivery path, with its Temporal plumbing in `delivery-runtime.ts`, and every outside call happens in an activity. History holds identifiers, quantities and counts, and customer rows stay inside the activities.
 
 1. **AwaitingSubmittedOrder** waits for Oracle to return the order as submitted. It relies on Oracle's record, so a lost submit response does no harm.
 2. **AwaitingShipmentCoverage** repeats until active shipment lines cover each ordered quantity. Every fifth attempt also re-reads the order to notice a cancellation or changed line.
@@ -95,15 +95,14 @@ The workflow returns `status`, `orderKey`, `orderNumber`, `linesVerified`, `reco
 
 ## Activities
 
-The activities are in `activities.ts`, and they reach outside systems only through the adapters.
+The activities are in `activities.ts`, and they reach outside systems only through the adapters. The first three are the required core, and the sweep and audit are optional.
 
 | Activity | Input | What it does |
 |---|---|---|
-| `findSubmittedOrder` | `orderKey` | Returns the order number and active lines, ignoring canceled and zero-quantity ones |
-| `checkShipmentCoverage` | `order`, `refreshEvery` | Makes one check per attempt, across all pages and warehouses, and fails until quantities are covered |
+| `checkOrderReady` | `orderKey`, `order`, `refreshEvery` | Makes one check per attempt. Without an order it returns the submitted order and its active lines, ignoring canceled and zero-quantity ones. With one it fails until shipment lines cover every quantity, across all pages and warehouses |
 | `reconcileOrder` | `order` | Reads the order, Oracle's lines and Foundry's objects, builds the expected fulfillment orders, writes what's missing, older or changed, removes what Oracle no longer supports, and returns only counts |
 | `recordDeliveryStatus` | `orderKey`, `orderNumber`, `stage`, `message` | Sends an event and saves the stage on the sales order; a failure never changes the result |
-| `sweepMissedOrders` | `lookbackMs`, `limit` | Starts recent submitted orders with no final status, skipping running and stopped ones, and stops after 5 runs per order |
+| `sweepMissedOrders` | `lookbackMs`, `limit` | Starts recent submitted orders with no final status, skipping running and stopped ones, and stops after 5 failed runs per order |
 | `auditDeliveredOrders` | `lookbackMs`, `limit` | Starts a low-priority reconcile for recently delivered orders, which corrects drift after their workflows ended |
 
 A line needs nothing more once its active rows add up to the ordered quantity, so split lines work, or once all its rows are canceled.
@@ -144,7 +143,7 @@ Finding the order and waiting for lines share one deadline. Each reconcile call 
 | Sweep frequency | 15 min, 0 to turn off | `SYNC_SWEEP_EVERY_MS` |
 | Sweep lookback | 24 hours | `SYNC_SWEEP_LOOKBACK_MS` |
 | Orders per sweep | 100 | `SYNC_SWEEP_LIMIT` |
-| Sweep runs per order | 5 | `SYNC_RECOVERY_MAX_RUNS` |
+| Failed sweep runs per order | 5 | `SYNC_RECOVERY_MAX_RUNS` |
 | Audit frequency | 24 hours, 0 to turn off | `SYNC_AUDIT_EVERY_MS` |
 | Audit lookback | 3 days | `SYNC_AUDIT_LOOKBACK_MS` |
 | Orders per audit | 100 | `SYNC_AUDIT_LIMIT` |
@@ -194,7 +193,7 @@ Temporal keeps workflow history for the namespace's retention period, which the 
    - `remove-shipment-lines` deletes shipment lines and fulfillment orders Oracle no longer supports.
    - `record-fulfillment-sync` saves the stage and ignores a repeated note.
 4. Call the hook in your approve action, after the Oracle submit and before the Foundry mirror.
-5. Give the worker its own Oracle and Foundry credentials, since it runs without a user session.
+5. Give the worker its own Oracle and Foundry credentials, since it runs without a user session. Put your app's authentication on `/api/order-delivery`, which has none here.
 6. Register `SourceOrderNumber` and `DeliveryStage` as Keyword search attributes, and `DeliveryOverdue` as Bool.
 7. Start `apps/worker/src/main.ts` with these variables:
    - `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_TASK_QUEUE`, `TEMPORAL_ORACLE_TASK_QUEUE`
@@ -260,7 +259,7 @@ These settings change how the simulators behave, with either way of running:
 ## Code
 
 ```text
-packages/order-delivery/src/         workflows, activities, system adapters, client, worker, explain, events, settings
+packages/order-delivery/src/         delivery workflow and runtime, background workflows, activities, system adapters, client, worker, explain, events, settings
 packages/contracts/src/              shared types, profiles, row builder, coverage, fulfillment order view
 apps/worker/src/main.ts              worker process, sweep schedule, metrics
 apps/web/lib/flow.ts                 create and approve flow
