@@ -85,7 +85,7 @@ export type OrderReference = {
   lines: OrderLine[];
 };
 
-export type CoverageResult = { status: "covered" | "canceled"; lines: OrderLine[] };
+export type OrderReadiness = { status: "found" | "covered" | "canceled"; order: OrderReference };
 
 export type RowDifferences = {
   missing: number;
