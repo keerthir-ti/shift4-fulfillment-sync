@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fulfillment Sync: Temporal Workflow Design</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm 16mm; }
+  * { box-sizing: border-box; }
+  body { font: 10.5pt/1.5 "Helvetica Neue", Helvetica, Arial, "Liberation Sans", sans-serif; color: #1f2933; margin: 0; }
+  .eyebrow { font-size: 9pt; letter-spacing: .1em; text-transform: uppercase; color: #1f5f99; font-weight: 700; margin: 0; }
+  h1 { font-size: 26pt; line-height: 1.15; margin: 4pt 0 6pt; color: #16202a; }
+  .lede { font-size: 12pt; color: #52606d; margin: 0 0 6pt; }
+  .status { font-size: 9pt; color: #616e7c; margin: 0 0 12pt; }
+  h2 { font-size: 16pt; color: #16202a; border-bottom: 1.5pt solid #1f5f99; padding-bottom: 3pt; margin: 18pt 0 8pt; break-after: avoid; }
+  h3 { font-size: 11.5pt; color: #16202a; margin: 12pt 0 4pt; break-after: avoid; }
+  p { margin: 0 0 7pt; }
+  table { width: 100%; border-collapse: collapse; margin: 4pt 0 10pt; font-size: 9pt; line-height: 1.35; }
+  tr { break-inside: avoid; }
+  th { text-align: left; background: #e6eef7; border-bottom: 1pt solid #1f5f99; padding: 4pt 6pt; color: #16202a; }
+  td { border-bottom: .5pt solid #cbd2d9; padding: 4pt 6pt; vertical-align: top; }
+  thead { display: table-header-group; }
+  code { font: 8.6pt "Liberation Mono", Menlo, Consolas, monospace; background: #f1f4f7; padding: 0 2pt; border-radius: 2pt; }
+  .formula { background: #e6eef7; text-align: center; font-weight: 700; padding: 6pt; margin: 6pt 0 8pt; border-radius: 3pt; break-inside: avoid; }
+  figure { margin: 6pt 0 10pt; break-inside: avoid; }
+  figcaption { font-size: 8.8pt; color: #616e7c; text-align: center; margin-top: 3pt; }
+  svg { width: 100%; height: auto; display: block; }
+  svg text { font-family: "Helvetica Neue", Helvetica, Arial, "Liberation Sans", sans-serif; }
+  .box { fill: #f5f7fa; stroke: #9aa5b1; stroke-width: 1; }
+  .new { fill: #e6eef7; stroke: #1f5f99; stroke-width: 1.4; }
+  .bad { fill: #fbeaea; stroke: #b42318; stroke-width: 1; }
+  .t { font-size: 12px; font-weight: 700; fill: #16202a; text-anchor: middle; }
+  .s { font-size: 10px; fill: #52606d; text-anchor: middle; }
+  .l { font-size: 10px; fill: #52606d; }
+  .ln { stroke: #616e7c; stroke-width: 1.2; fill: none; marker-end: url(#a); }
+  .bl { stroke: #1f5f99; stroke-width: 1.6; fill: none; marker-end: url(#b); }
+  .da { stroke: #b42318; stroke-width: 1.2; stroke-dasharray: 5 3; fill: none; marker-end: url(#c); }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute"><defs>
+  <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#616e7c"/></marker>
+  <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#1f5f99"/></marker>
+  <marker id="c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#b42318"/></marker>
+</defs></svg>
+
+<p class="eyebrow">Temporal workflow design</p>
+<h1>Fulfillment Sync</h1>
+<p class="lede">Getting an approved sales order to the warehouse without waiting for a scheduled data copy, and knowing whether it arrived.</p>
+<p class="status">Describes the code in this repository. It runs on local simulators with synthetic data and has not been run against Oracle Fusion or Palantir Foundry.</p>
+
+<h2>1. The problem</h2>
+<p>After an order is approved in Oracle Fusion, warehouse staff can't see it in Fulfillment Manager for about 15–20 minutes. Oracle accepts the order immediately, then builds shipment lines in the background. Fulfillment Manager reads from Palantir Foundry, and those lines reach Foundry only through a scheduled CData snapshot of the whole table. The app receives no signal from Oracle at any point.</p>
+
+<figure>
+<svg viewBox="0 0 720 200" role="img" aria-label="Current path from approval to the warehouse">
+  <rect class="box" x="10" y="20" width="130" height="58" rx="6"/><text class="t" x="75" y="45">Next.js app</text><text class="s" x="75" y="62">approve, mirror, read</text>
+  <rect class="box" x="210" y="20" width="150" height="58" rx="6"/><text class="t" x="285" y="45">Oracle Fusion</text><text class="s" x="285" y="62">builds lines in background</text>
+  <rect class="box" x="430" y="20" width="130" height="58" rx="6"/><text class="t" x="495" y="45">CData connector</text><text class="s" x="495" y="62">copies every row</text>
+  <rect class="box" x="430" y="125" width="130" height="58" rx="6"/><text class="t" x="495" y="150">Palantir Foundry</text><text class="s" x="495" y="167">copy, then index</text>
+  <rect class="box" x="10" y="125" width="130" height="58" rx="6"/><text class="t" x="75" y="150">Warehouse user</text><text class="s" x="75" y="167">Fulfillment Manager</text>
+  <path class="ln" d="M140 49H208"/><text class="l" x="150" y="42">submit</text>
+  <path class="da" d="M360 49H428"/><text class="l" x="368" y="42">schedule</text>
+  <path class="da" d="M495 78V123"/><text class="l" x="503" y="105">append / snapshot</text>
+  <path class="ln" d="M428 154H142"/><text class="l" x="245" y="147">reads Foundry only</text>
+  <text class="s" x="285" y="102" style="fill:#b42318">Sends no signal back to the app</text>
+</svg>
+<figcaption>Figure 1. Today's path. Dashed lines run on a schedule.</figcaption>
+</figure>
+
+<div class="formula">Delay = Oracle processing + wait for next snapshot + snapshot run time + indexing</div>
+
+<p>The client raised these issues on the architecture call:</p>
+<table>
+<thead><tr><th style="width:24%">Issue</th><th>What it means</th></tr></thead>
+<tbody>
+<tr><td><strong>Delay</strong></td><td>Staff wait for the next snapshot, even when Oracle finished long ago.</td></tr>
+<tr><td><strong>Growth</strong></td><td>Each snapshot reads everything, so it slows as data grows and uses the shared Oracle REST limit.</td></tr>
+<tr><td><strong>Silent failure</strong></td><td>An order that doesn't reach fulfillment raises nothing. Finding out means a manual check in Oracle.</td></tr>
+<tr><td><strong>Constraints</strong></td><td>Oracle populates too many fields to write shipment lines optimistically. UIs can't read Oracle live because of REST limits and paging. Analytics still need the snapshot.</td></tr>
+</tbody>
+</table>
+
+<p>This reproduces locally with no Temporal running. With the app and simulators in Docker, 5 seconds of Oracle processing and a 60-second snapshot, a browser test saw Oracle holding the line after 5.9 seconds, while the order reached Fulfillment Manager only after 64.1 seconds. On simulated time with a 15-minute schedule, the slowest order took 17.5 minutes with no existing data and 22.3 minutes with 100,000 lines. The schedules come from the client, but the other timings are assumptions, so these aren't Shift4 measurements.</p>
+
+<h2>2. The proposed solution</h2>
+<p>One durable Temporal workflow follows each approved order and <strong>reconciles</strong> it. Once Oracle's shipment lines cover the order, one operation reads both systems, writes only what differs, and repeats until they match. That single comparison handles retries, restarts, late changes and verification, and it also answers "why isn't this order here?" without opening Oracle. A scheduled sweep finds any approved order that was missed. The existing snapshot keeps running for analytics and correction, and could later run less often. Release for picking, create shipment, carriers and invoices aren't part of this phase.</p>
+
+<figure>
+<svg viewBox="0 0 720 330" role="img" aria-label="Solution architecture">
+  <rect class="box" x="10" y="20" width="120" height="52" rx="6"/><text class="t" x="70" y="42">Users</text><text class="s" x="70" y="58">sales, warehouse</text>
+  <rect class="box" x="190" y="20" width="130" height="52" rx="6"/><text class="t" x="255" y="42">Next.js app</text><text class="s" x="255" y="58">approve action, UIs</text>
+  <rect class="box" x="530" y="20" width="170" height="52" rx="6"/><text class="t" x="615" y="42">Palantir Foundry</text><text class="s" x="615" y="58">ontology, both UIs read here</text>
+  <rect class="new" x="190" y="130" width="130" height="58" rx="6"/><text class="t" x="255" y="154">Temporal</text><text class="s" x="255" y="171">workflows, schedule</text>
+  <rect class="new" x="400" y="130" width="150" height="58" rx="6"/><text class="t" x="475" y="154">Workers</text><text class="s" x="475" y="171">two task queues</text>
+  <rect class="box" x="400" y="260" width="150" height="52" rx="6"/><text class="t" x="475" y="282">Oracle Fusion</text><text class="s" x="475" y="298">system of record</text>
+  <rect class="box" x="600" y="170" width="110" height="52" rx="6"/><text class="t" x="655" y="192">CData</text><text class="s" x="655" y="208">connector</text>
+  <rect class="new" x="10" y="130" width="120" height="58" rx="6"/><text class="t" x="70" y="154">Recovery sweep</text><text class="s" x="70" y="171">Temporal Schedule</text>
+
+  <path class="ln" d="M130 46H188"/>
+  <path class="ln" d="M320 38H528"/><text class="l" x="372" y="31">3. mirror order</text>
+  <path class="ln" d="M528 58H322"/><text class="l" x="382" y="72">reads</text>
+  <path class="bl" d="M255 72V128"/><text class="l" x="262" y="104">2. start workflow</text>
+  <path class="ln" d="M210 72V96H160V286H398"/><text class="l" x="168" y="279">1. submit order</text>
+  <path class="bl" d="M130 159H188"/>
+  <path class="bl" d="M320 159H398"/><text class="l" x="339" y="152">tasks</text>
+  <path class="bl" d="M475 130V90H600V74"/><text class="l" x="482" y="104">write, read back, status</text>
+  <path class="bl" d="M475 188V258"/><text class="l" x="483" y="226">one order, rate limited</text>
+  <path class="da" d="M550 286H655V224"/><text class="l" x="570" y="279">schedule, all rows</text>
+  <path class="da" d="M672 170V74"/>
+  <path class="da" d="M400 302H240V190"/><text class="l" x="248" y="298">optional event: check now</text>
+</svg>
+<figcaption>Figure 2. Blue marks what this design adds. Dashed lines are scheduled or optional. Workers reach Oracle and Foundry only through two adapters, which the client replaces with their own helpers. Oracle Fusion, Foundry and CData are simulated in this repository.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th style="width:27%">Issue</th><th>How the solution answers it</th></tr></thead>
+<tbody>
+<tr><td>Delay</td><td>The order no longer waits for a schedule. It appears soon after Oracle creates its lines, so Oracle's own processing time is the floor.</td></tr>
+<tr><td>Growth</td><td>Each read covers one order, so its cost doesn't depend on the size of the table. Oracle reads share a limit across workers.</td></tr>
+<tr><td>Silent failure</td><td>Every order ends with a known status and reason, overdue orders raise an alert event, and one command explains any order from live data.</td></tr>
+<tr><td>Lost responses, restarts, repeats</td><td>Workflow ID is known before any Oracle call, state survives worker restarts, and each pass reads fresh data and writes only differences, so repeating it is safe.</td></tr>
+<tr><td>Customer data</td><td>Rows stay inside the activities, so Temporal history holds only keys, quantities and counts.</td></tr>
+<tr><td>Rollback</td><td><code>FULFILLMENT_SYNC</code> off returns the app to today's behaviour.</td></tr>
+</tbody>
+</table>
+
+<h2>3. Workflow design</h2>
+<h3><code>deliverOrderToFulfillment</code>: one per approved order</h3>
+<p>The approve action submits to Oracle, starts this workflow, then mirrors to Foundry, so a mirror failure can't hold the order back. The workflow contains control flow only, and all I/O happens in activities. Its ID, <code>order-delivery:&lt;SourceTransactionNumber&gt;</code>, is known before any Oracle call, so a lost response can't lose the order. <code>USE_EXISTING</code> makes a double click join the running workflow. <code>ALLOW_DUPLICATE</code> lets the sweep or a retry start again after a run has closed.</p>
+<figure>
+<svg viewBox="0 0 720 205" role="img" aria-label="Workflow stages">
+  <rect class="new" x="10" y="35" width="130" height="46" rx="6"/><text class="t" x="75" y="54">Awaiting</text><text class="t" x="75" y="70">SubmittedOrder</text>
+  <rect class="new" x="175" y="35" width="130" height="46" rx="6"/><text class="t" x="240" y="54">Awaiting</text><text class="t" x="240" y="70">ShipmentCoverage</text>
+  <rect class="new" x="340" y="35" width="110" height="46" rx="6"/><text class="t" x="395" y="62">Reconciling</text>
+  <rect class="new" x="545" y="35" width="150" height="46" rx="6"/><text class="t" x="620" y="62">DeliveryVerified</text>
+  <path class="ln" d="M140 58H173"/><path class="ln" d="M305 58H338"/><path class="ln" d="M450 58H543"/><text class="l" x="462" y="51">nothing differs</text>
+  <path class="ln" d="M420 35V16H370V33"/><text class="l" x="330" y="11">wrote differences: verify again, up to 4 passes</text>
+  <path class="ln" d="M660 35V16H600V33"/><text class="l" x="590" y="11">settle watch: one more pass</text>
+  <rect class="box" x="10" y="128" width="130" height="40" rx="6"/><text class="t" x="75" y="153">CanceledInOracle</text>
+  <path class="ln" d="M75 81V126"/><path class="ln" d="M240 81V105H100V126"/><path class="ln" d="M365 81V112H125V126"/><text class="l" x="130" y="100">canceled</text>
+  <rect class="bad" x="340" y="128" width="130" height="40" rx="6"/><text class="t" x="405" y="153">ActionRequired</text>
+  <path class="ln" d="M420 81V126"/><text class="l" x="426" y="110">still different, or rejected</text>
+  <path class="ln" d="M285 81V148H338"/><text class="l" x="292" y="143">deadline</text>
+  <rect class="box" x="565" y="128" width="130" height="40" rx="6"/><text class="t" x="630" y="153">OperatorStopped</text>
+  <text class="s" x="630" y="185">from any stage</text>
+</svg>
+<figcaption>Figure 3. Stages, held in the <code>DeliveryStage</code> search attribute. <code>DeliveryOverdue</code> is a separate flag raised by a timer, so an overdue order still shows where it is, and work continues.</figcaption>
+</figure>
+
+<h3>Activities</h3>
+<table>
+<thead><tr><th style="width:21%">Activity</th><th style="width:38%">What it does</th><th style="width:20%">Uses</th><th>Queue and retry</th></tr></thead>
+<tbody>
+<tr><td><code>findSubmittedOrder</code></td><td>Reads the order by source number. Fails until Oracle returns it as submitted, which covers a lost submit response. Returns its number and active lines.</td><td>Oracle: <code>findOrder</code></td><td><code>oracle-reads</code>. Polling, until the deadline</td></tr>
+<tr><td><code>checkShipmentCoverage</code></td><td>One check per attempt. Fails until active shipment lines cover every ordered quantity, across all pages and warehouses. Every fifth attempt it re-reads the order to notice a cancellation.</td><td>Oracle: <code>listShipmentLines</code>, sometimes <code>findOrder</code></td><td><code>oracle-reads</code>. Polling, sharing the same deadline</td></tr>
+<tr><td><code>reconcileOrder</code></td><td>The core. Reads the order, Oracle's lines and Foundry's rows, writes rows that are missing, older or changed, and removes rows Oracle no longer has. Returns only counts.</td><td>Oracle: both reads. Foundry: read, <code>sync-shipment-lines</code>, <code>remove-shipment-lines</code></td><td><code>oracle-reads</code>. 30-minute window</td></tr>
+<tr><td><code>recordDeliveryStatus</code></td><td>Sends an audit or alert event, and saves the stage on the sales order. A failure here never changes the result.</td><td>Event sink. Foundry: <code>record-fulfillment-sync</code></td><td><code>order-delivery</code>. 3 attempts</td></tr>
+<tr><td><code>sweepMissedOrders</code></td><td>Starts recent submitted orders with no final status. Skips running and stopped ones, and stops after 5 runs per order.</td><td>Recovery index. Temporal client</td><td><code>order-delivery</code>. 3 attempts</td></tr>
+</tbody>
+</table>
+
+<h3><code>recoverySweepWorkflow</code>: the optional safety net</h3>
+<p>A Temporal Schedule runs it every 15 minutes, looking back 24 hours and covering at most 100 orders. It catches what a single request can't: Temporal unavailable at approval, or a process that crashed between submit and start. Overlap is set to Skip, so a slow sweep can't pile up. Without it, the snapshot remains the fallback.</p>
+
+<h3>Temporal features used</h3>
+<table>
+<thead><tr><th style="width:29%">Feature</th><th>Use</th></tr></thead>
+<tbody>
+<tr><td>Activity retries as polling</td><td>From 5 seconds, growing 1.5x to 60 seconds. No history growth, no held worker slot, and the UI shows attempts and the last result.</td></tr>
+<tr><td>Timeouts</td><td>30 seconds per attempt, a 4-hour deadline for finding and waiting, and a 30-minute window that rides out a Foundry outage.</td></tr>
+<tr><td>Failure types</td><td>A 429 honours <code>Retry-After</code>. A 401 or 403 keeps retrying, so an expired credential doesn't fail every open order. A rejected request or unexpected error stops at once.</td></tr>
+<tr><td>Task queue rate limit</td><td>Holds Oracle-reading activities to one limit across all workers.</td></tr>
+<tr><td>Durable timers</td><td>Raise the overdue flag, and run the settle watch that catches a change made soon after delivery.</td></tr>
+<tr><td>Signal, Signal-with-Start</td><td>An optional Oracle event wakes a waiting order to check at once, or starts one that approval missed. It's only a hint, so a lost event only costs time.</td></tr>
+<tr><td>Search attributes, query</td><td><code>DeliveryStage</code>, <code>DeliveryOverdue</code> and <code>SourceOrderNumber</code> find orders by situation. <code>getDeliveryProgress</code> returns the current state.</td></tr>
+<tr><td>Schedule, cancellation, replay test</td><td>The Schedule runs the sweep, an operator can stop a run cleanly, and a test replays recorded history to catch breaking code changes.</td></tr>
+<tr><td>SDK metrics</td><td>Prometheus metrics, where rising schedule-to-start latency shows workers falling behind.</td></tr>
+</tbody>
+</table>
+
+<h3>Failures and edge cases</h3>
+<table>
+<thead><tr><th style="width:42%">What goes wrong</th><th>What happens</th></tr></thead>
+<tbody>
+<tr><td>Oracle rejects the submit</td><td>No workflow starts, and the user sees the error. A 429 tells the user Oracle is busy.</td></tr>
+<tr><td>Submit response lost, or a 5xx</td><td>Workflow starts as <code>uncertain</code> and trusts what Oracle holds.</td></tr>
+<tr><td>Submit never reached Oracle</td><td>Keeps checking, then ActionRequired. Never a false success.</td></tr>
+<tr><td>Temporal unavailable at approval</td><td>Approval succeeds, <code>NotStarted</code> is recorded, and the sweep starts it later.</td></tr>
+<tr><td>Foundry mirror fails after submit</td><td>Workflow has already started, so the order is still delivered.</td></tr>
+<tr><td>Worker restarts during a wait</td><td>Another worker continues from history, with no duplicates.</td></tr>
+<tr><td>Foundry outage, or a lost write response</td><td>Retries, and the next read shows what was really written, so nothing is written twice.</td></tr>
+<tr><td>Oracle changes between read and write</td><td>The next pass sees Foundry is older and writes the current rows.</td></tr>
+<tr><td>Same timestamp, different data</td><td>Content is compared too, so the row is written.</td></tr>
+<tr><td>Line added, or order canceled, during the run</td><td>Line added: delivery waits until it's covered. Canceled: ends as CanceledInOracle, including just before reconciling.</td></tr>
+<tr><td>Row in Foundry that Oracle no longer has</td><td>Removed, and a later snapshot doesn't bring it back.</td></tr>
+<tr><td>Expired credentials</td><td>Keeps retrying, and recovers once they're fixed.</td></tr>
+<tr><td>A bad date or programming error</td><td>Stops at once with the reason, rather than looking like a long wait.</td></tr>
+<tr><td>Lines never appear</td><td>Overdue at 30 minutes, then ActionRequired at 4 hours, with the reason recorded.</td></tr>
+<tr><td>An order keeps failing</td><td>The sweep stops restarting it after 5 runs, and never restarts a delivered or stopped order.</td></tr>
+</tbody>
+</table>
+
+<h2>4. Pros and cons</h2>
+<h3>Pros</h3>
+<table>
+<thead><tr><th style="width:32%">Benefit</th><th>Why it matters</th></tr></thead>
+<tbody>
+<tr><td><strong>No wait for a schedule</strong></td><td>The order appears soon after Oracle creates its lines. With the same containers and settings, approve to visible went from 64.1 seconds to 8.9 seconds, which is Oracle's 5 seconds plus the wait for the next check.</td></tr>
+<tr><td><strong>Timing no longer depends on luck</strong></td><td>On the simulators, the wait varied from 5.5 to 20.5 seconds with the moment of approval today, and stayed at 2.1–2.2 seconds with the workflow.</td></tr>
+<tr><td><strong>Cost follows the order, not the table</strong></td><td>Each read covers one order, so this path doesn't slow down as data grows.</td></tr>
+<tr><td><strong>One simple, repeatable core</strong></td><td>Retries, restarts, late changes and verification all go through one comparison, and repeating it is always safe.</td></tr>
+<tr><td><strong>Every order has an answer</strong></td><td>Each ends with a known status and reason, overdue orders raise an event, and <code>make explain</code> answers from live data with no manual check in Oracle.</td></tr>
+<tr><td><strong>Delivered means checked</strong></td><td>The status is set only when a pass finds both systems match, and the settle watch checks once more.</td></tr>
+<tr><td><strong>Customer data stays out of Temporal</strong></td><td>History holds keys, quantities and counts, so no Payload Codec is needed for this and large orders can't hit payload limits.</td></tr>
+<tr><td><strong>Survives failures</strong></td><td>Worker restarts, lost responses, Foundry outages and expired credentials pause the work rather than lose it.</td></tr>
+<tr><td><strong>Ready for Oracle events</strong></td><td>If Oracle's events cover this status, they cut the wait with no redesign, and polling remains the fallback.</td></tr>
+<tr><td><strong>Low-risk rollout</strong></td><td>One flag returns the app to today's behaviour, the sweep is optional, and the snapshot remains the safety net.</td></tr>
+</tbody>
+</table>
+<h3>Cons</h3>
+<table>
+<thead><tr><th style="width:27%">Drawback</th><th style="width:41%">Effect</th><th>How to handle it</th></tr></thead>
+<tbody>
+<tr><td><strong>Not run on real systems</strong></td><td>Adapters, Foundry actions and all timings are still assumptions.</td><td>Implement the adapters on the client's DEV environment</td></tr>
+<tr><td><strong>Oracle time is the floor, and unknown</strong></td><td>The workflow can't read lines Oracle hasn't created, so no latency can be promised yet.</td><td>Measure each step on DEV</td></tr>
+<tr><td><strong>Two writers to the same data</strong></td><td>Foundry compares the edit's time with Oracle's UTC timestamp, so a clock difference could hide a change from the snapshot. The settle watch catches this only soon after delivery. These rules come from Foundry's documentation and aren't tested on a real tenant.</td><td>Confirm timestamp type and clock difference, and test on DEV</td></tr>
+<tr><td><strong>Rows deleted after the workflow ends</strong></td><td>Foundry keeps an object an Action created when its source row disappears, so it stays until something removes it.</td><td>Learn whether Oracle deletes or only cancels shipment lines</td></tr>
+<tr><td><strong>More Oracle reads per order</strong></td><td>Each pass makes at least two Oracle calls. The limit counts activities, not HTTP calls, the app or the connector. A stricter limit also adds delay: 1 activity per second is part of the 8.9 seconds above.</td><td>Get the real limit, then tune the rate and polling</td></tr>
+<tr><td><strong>New parts to run</strong></td><td>Temporal and workers need operating, and the team needs to learn them.</td><td>Start on EC2 or Temporal Cloud at low volume</td></tr>
+<tr><td><strong>Integration work</strong></td><td>The client implements two adapters with six methods, creates three Foundry actions, and adds a service identity. A per-row version check may need a function-backed action.</td><td>Use the simulators as a reference, and skip the sweep at first</td></tr>
+<tr><td><strong>Alerts need a destination</strong></td><td>Overdue and ActionRequired events can post to a webhook, but no channel is chosen yet.</td><td>Choose one with the client</td></tr>
+<tr><td><strong>Oracle events aren't connected</strong></td><td>The Signal path is built and tested, but nobody has confirmed which Oracle status means shipment lines exist.</td><td>Confirm with the client, or keep polling</td></tr>
+<tr><td><strong>Holds aren't recognised</strong></td><td>An order on hold polls until the deadline, then shows ActionRequired.</td><td>Learn how holds appear in Oracle</td></tr>
+<tr><td><strong>Not production hardened</strong></td><td>No workflow versioning yet, and the worker bundles its code at startup. History lasts 30–90 days unless exported through the event sink.</td><td>Add versioning and a prebuilt bundle before the first release</td></tr>
+</tbody>
+</table>
+</body>
+</html>
