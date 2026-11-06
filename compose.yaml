@@ -1,0 +1,129 @@
+# Simulators with synthetic data. Nothing here calls a real Oracle or Foundry tenant.
+# Ports are published on 127.0.0.1 only. Override any of them, for example: WEB_PORT=3000 make up
+name: shift4-fulfillment-sync
+
+x-service: &service
+  image: shift4-fulfillment-sync:local
+  build: .
+  init: true
+  restart: "no"
+  working_dir: /app
+
+x-health: &health
+  interval: 3s
+  timeout: 3s
+  retries: 40
+
+x-environment: &environment
+  BIND_HOST: 0.0.0.0
+  SCENARIO_ID: ${SCENARIO_ID:-local-demo}
+  PROFILE: ${PROFILE:-accelerated}
+  ORACLE_EXISTING_SHIPMENTS: ${ORACLE_EXISTING_SHIPMENTS:-0}
+  ORACLE_URL: http://oracle:4010
+  FOUNDRY_URL: http://foundry:4020
+  CONNECTOR_URL: http://connector:4030
+  FULFILLMENT_SYNC: ${FULFILLMENT_SYNC:-off}
+  TEMPORAL_ADDRESS: temporal:7233
+  # Shorter than production defaults, so results appear quickly in a demo.
+  SYNC_POLL_INITIAL_MS: ${SYNC_POLL_INITIAL_MS:-1000}
+  SYNC_POLL_MAX_MS: ${SYNC_POLL_MAX_MS:-5000}
+  SYNC_OVERDUE_AFTER_MS: ${SYNC_OVERDUE_AFTER_MS:-60000}
+  SYNC_DEADLINE_MS: ${SYNC_DEADLINE_MS:-300000}
+  SYNC_SWEEP_EVERY_MS: ${SYNC_SWEEP_EVERY_MS:-60000}
+  SYNC_SETTLE_WATCH_MS: ${SYNC_SETTLE_WATCH_MS:-30000}
+
+services:
+  oracle:
+    <<: *service
+    command: ["node_modules/.bin/tsx", "services/sim/src/oracle/main.ts"]
+    environment: *environment
+    ports:
+      - "127.0.0.1:${ORACLE_PORT:-14010}:4010"
+    volumes:
+      - oracle-data:/app/.local/oracle
+    healthcheck:
+      <<: *health
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4010/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+
+  foundry:
+    <<: *service
+    command: ["node_modules/.bin/tsx", "services/sim/src/foundry/main.ts"]
+    environment: *environment
+    ports:
+      - "127.0.0.1:${FOUNDRY_PORT:-14020}:4020"
+    volumes:
+      - foundry-data:/app/.local/foundry
+    healthcheck:
+      <<: *health
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4020/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+
+  connector:
+    <<: *service
+    command: ["node_modules/.bin/tsx", "services/sim/src/connector/main.ts"]
+    environment: *environment
+    ports:
+      - "127.0.0.1:${CONNECTOR_PORT:-14030}:4030"
+    volumes:
+      - connector-data:/app/.local/connector
+    depends_on:
+      oracle:
+        condition: service_healthy
+      foundry:
+        condition: service_healthy
+    healthcheck:
+      <<: *health
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4030/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+
+  web:
+    <<: *service
+    working_dir: /app/apps/web
+    command: ["node_modules/.bin/next", "dev", "--port", "3000", "--hostname", "0.0.0.0"]
+    environment: *environment
+    ports:
+      - "127.0.0.1:${WEB_PORT:-13000}:3000"
+    depends_on:
+      connector:
+        condition: service_healthy
+    healthcheck:
+      <<: *health
+      start_period: 60s
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+
+  # The workflow path. Start with: make up-sync
+  temporal:
+    profiles: ["sync"]
+    image: temporalio/temporal:${TEMPORAL_IMAGE_TAG:-1.10.0}
+    restart: "no"
+    command: ["server", "start-dev", "--ip", "0.0.0.0", "--port", "7233", "--ui-port", "8233", "--search-attribute", "SourceOrderNumber=Keyword", "--search-attribute", "DeliveryStage=Keyword", "--search-attribute", "DeliveryOverdue=Bool"]
+    ports:
+      - "127.0.0.1:${TEMPORAL_PORT:-17243}:7233"
+      - "127.0.0.1:${TEMPORAL_UI_PORT:-18243}:8233"
+    healthcheck:
+      <<: *health
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "127.0.0.1:7233"]
+
+  worker:
+    <<: *service
+    profiles: ["sync"]
+    command: ["node_modules/.bin/tsx", "apps/worker/src/main.ts"]
+    environment:
+      <<: *environment
+      WORKER_HEALTH_PORT: "4040"
+      WORKER_METRICS_PORT: "9464"
+      DELIVERY_ALERT_WEBHOOK_URL: ${DELIVERY_ALERT_WEBHOOK_URL:-}
+    ports:
+      - "127.0.0.1:${WORKER_METRICS_PORT:-19464}:9464"
+    depends_on:
+      temporal:
+        condition: service_healthy
+      foundry:
+        condition: service_healthy
+    healthcheck:
+      <<: *health
+      start_period: 60s
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4040/').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+
+volumes:
+  oracle-data:
+  foundry-data:
+  connector-data:

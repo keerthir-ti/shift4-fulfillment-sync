@@ -1,0 +1,11 @@
+**/node_modules
+**/.next
+**/*.tsbuildinfo
+**/test-results
+**/playwright-report
+.local
+.git
+.env
+artifacts
+docs
+*.md
