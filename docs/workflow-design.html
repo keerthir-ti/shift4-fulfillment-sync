@@ -83,7 +83,7 @@
 <p>This reproduces locally with no Temporal running. With the app and simulators in Docker, 5 seconds of Oracle processing and a 60-second snapshot, a browser test saw Oracle holding the line after 5.9 seconds, while the order reached Fulfillment Manager only after 64.1 seconds. On simulated time with a 15-minute schedule, the slowest order took 17.5 minutes with no existing data and 22.3 minutes with 100,000 lines. The schedules come from the client, but the other timings are assumptions, so these aren't Shift4 measurements.</p>
 
 <h2>2. The proposed solution</h2>
-<p>One durable Temporal workflow follows each approved order and <strong>reconciles</strong> it. Once Oracle's shipment lines cover the order, one operation reads both systems, writes only what differs, and repeats until they match. That single comparison handles retries, restarts, late changes and verification, and it also answers "why isn't this order here?" without opening Oracle. A scheduled sweep finds any approved order that was missed. The existing snapshot keeps running for analytics and correction, and could later run less often. Release for picking, create shipment, carriers and invoices aren't part of this phase.</p>
+<p>One durable Temporal workflow follows each approved order and <strong>reconciles</strong> it. Once Oracle's shipment lines cover the order, one operation reads both systems, writes only what differs, and repeats until the shipment lines and the fulfillment order the warehouse reads both match. That single comparison handles retries, restarts, late changes and verification, and it also answers "why isn't this order here?" without opening Oracle. A scheduled sweep finds any approved order that was missed, and a scheduled audit corrects drift on delivered ones. The existing snapshot keeps running for analytics and correction, and could later run less often. Release for picking, create shipment, carriers and invoices aren't part of this phase.</p>
 
 <figure>
 <svg viewBox="0 0 720 330" role="img" aria-label="Solution architecture">
@@ -123,6 +123,8 @@
 <tr><td>Rollback</td><td><code>FULFILLMENT_SYNC</code> off returns the app to today's behaviour.</td></tr>
 </tbody>
 </table>
+<p>Measured through the real app flow, on the same simulators and settings. Oracle processing (90 seconds), snapshot costs and the 120 calls per minute limit are assumptions, so these show how each option behaves and aren't Shift4 measurements.</p>
+<!--ALTERNATIVES-->
 
 <h2>3. Workflow design</h2>
 <h3><code>deliverOrderToFulfillment</code>: one per approved order</h3>
@@ -153,14 +155,14 @@
 <tbody>
 <tr><td><code>findSubmittedOrder</code></td><td>Reads the order by source number. Fails until Oracle returns it as submitted, which covers a lost submit response. Returns its number and active lines.</td><td>Oracle: <code>findOrder</code></td><td><code>oracle-reads</code>. Polling, until the deadline</td></tr>
 <tr><td><code>checkShipmentCoverage</code></td><td>One check per attempt. Fails until active shipment lines cover every ordered quantity, across all pages and warehouses. Every fifth attempt it re-reads the order to notice a cancellation.</td><td>Oracle: <code>listShipmentLines</code>, sometimes <code>findOrder</code></td><td><code>oracle-reads</code>. Polling, sharing the same deadline</td></tr>
-<tr><td><code>reconcileOrder</code></td><td>The core. Reads the order, Oracle's lines and Foundry's rows, writes rows that are missing, older or changed, and removes rows Oracle no longer has. Returns only counts.</td><td>Oracle: both reads. Foundry: read, <code>sync-shipment-lines</code>, <code>remove-shipment-lines</code></td><td><code>oracle-reads</code>. 30-minute window</td></tr>
+<tr><td><code>reconcileOrder</code></td><td>The core. Reads the order, Oracle's lines and Foundry's objects, builds the expected fulfillment orders, writes what's missing, older or changed, and removes what Oracle no longer supports. Returns only counts.</td><td>Oracle: both reads. Foundry: read, <code>sync-shipment-lines</code>, <code>remove-shipment-lines</code></td><td><code>oracle-reads</code>. 30-minute window</td></tr>
 <tr><td><code>recordDeliveryStatus</code></td><td>Sends an audit or alert event, and saves the stage on the sales order. A failure here never changes the result.</td><td>Event sink. Foundry: <code>record-fulfillment-sync</code></td><td><code>order-delivery</code>. 3 attempts</td></tr>
 <tr><td><code>sweepMissedOrders</code></td><td>Starts recent submitted orders with no final status. Skips running and stopped ones, and stops after 5 runs per order.</td><td>Recovery index. Temporal client</td><td><code>order-delivery</code>. 3 attempts</td></tr>
 </tbody>
 </table>
 
-<h3><code>recoverySweepWorkflow</code>: the optional safety net</h3>
-<p>A Temporal Schedule runs it every 15 minutes, looking back 24 hours and covering at most 100 orders. It catches what a single request can't: Temporal unavailable at approval, or a process that crashed between submit and start. Overlap is set to Skip, so a slow sweep can't pile up. Without it, the snapshot remains the fallback.</p>
+<h3><code>recoverySweepWorkflow</code> and <code>deliveryAuditWorkflow</code>: the optional safety nets</h3>
+<p>A Temporal Schedule runs it every 15 minutes, looking back 24 hours and covering at most 100 orders. It catches what a single request can't: Temporal unavailable at approval, or a process that crashed between submit and start. Overlap is set to Skip, so a slow sweep can't pile up. Without it, the snapshot remains the fallback. A second Schedule runs the audit daily through <code>auditDeliveredOrders</code>, which runs recently delivered orders through reconcile again to correct drift after their workflows ended. Both run below the priority of new approvals.</p>
 
 <h3>Temporal features used</h3>
 <table>
@@ -171,10 +173,12 @@
 <tr><td>Failure types</td><td>A 429 honours <code>Retry-After</code>. A 401 or 403 keeps retrying, so an expired credential doesn't fail every open order. A rejected request or unexpected error stops at once.</td></tr>
 <tr><td>Task queue rate limit</td><td>Holds Oracle-reading activities to one limit across all workers.</td></tr>
 <tr><td>Durable timers</td><td>Raise the overdue flag, and run the settle watch that catches a change made soon after delivery.</td></tr>
-<tr><td>Signal, Signal-with-Start</td><td>An optional Oracle event wakes a waiting order to check at once, or starts one that approval missed. It's only a hint, so a lost event only costs time.</td></tr>
-<tr><td>Search attributes, query</td><td><code>DeliveryStage</code>, <code>DeliveryOverdue</code> and <code>SourceOrderNumber</code> find orders by situation. <code>getDeliveryProgress</code> returns the current state.</td></tr>
-<tr><td>Schedule, cancellation, replay test</td><td>The Schedule runs the sweep, an operator can stop a run cleanly, and a test replays recorded history to catch breaking code changes.</td></tr>
-<tr><td>SDK metrics</td><td>Prometheus metrics, where rising schedule-to-start latency shows workers falling behind.</td></tr>
+<tr><td>Signal, Signal-with-Start, batch operations</td><td>An operator or Oracle event wakes a waiting order to check at once, or starts one that's missing. After an outage, one command signals every overdue order. It's only a hint, so a lost event only costs time.</td></tr>
+<tr><td>Task Queue Priority</td><td>Recovery and audit work run below new approvals, so a backlog can't delay them.</td></tr>
+<tr><td>Search attributes, query</td><td><code>DeliveryStage</code>, <code>DeliveryOverdue</code> and <code>SourceOrderNumber</code> find orders by situation. <code>getDeliveryProgress</code> returns the current state, and each run shows a summary and live status in the Temporal UI.</td></tr>
+<tr><td>Schedules, cancellation</td><td>Schedules run the sweep and audit, and an operator can stop a run cleanly.</td></tr>
+<tr><td>Replay and time-skipping tests</td><td>One replays recorded history to catch breaking code changes. The other proves the real 30-minute and 4-hour timings in seconds.</td></tr>
+<tr><td>SDK and workflow metrics</td><td>Prometheus metrics for Oracle's real wait, approve to visible and outcomes, which turn the first DEV run into measurements. Rising schedule-to-start latency shows workers falling behind.</td></tr>
 </tbody>
 </table>
 
@@ -192,11 +196,14 @@
 <tr><td>Oracle changes between read and write</td><td>The next pass sees Foundry is older and writes the current rows.</td></tr>
 <tr><td>Same timestamp, different data</td><td>Content is compared too, so the row is written.</td></tr>
 <tr><td>Line added, or order canceled, during the run</td><td>Line added: delivery waits until it's covered. Canceled: ends as CanceledInOracle, including just before reconciling.</td></tr>
-<tr><td>Row in Foundry that Oracle no longer has</td><td>Removed, and a later snapshot doesn't bring it back.</td></tr>
+<tr><td>Lines written, but the fulfillment order missing or wrong</td><td>Not delivered: the next pass writes it, and verifies it.</td></tr>
+<tr><td>Row in Foundry that Oracle no longer has</td><td>Removed, and a later snapshot doesn't bring it back. An empty Oracle answer never removes anything.</td></tr>
+<tr><td>Foundry stale-object conflict (409)</td><td>Retries, and a fresh read resolves it.</td></tr>
 <tr><td>Expired credentials</td><td>Keeps retrying, and recovers once they're fixed.</td></tr>
 <tr><td>A bad date or programming error</td><td>Stops at once with the reason, rather than looking like a long wait.</td></tr>
 <tr><td>Lines never appear</td><td>Overdue at 30 minutes, then ActionRequired at 4 hours, with the reason recorded.</td></tr>
-<tr><td>An order keeps failing</td><td>The sweep stops restarting it after 5 runs, and never restarts a delivered or stopped order.</td></tr>
+<tr><td>An order keeps failing</td><td>The sweep stops restarting it after 5 runs, and never restarts a delivered or stopped order. One order that can't start doesn't affect the others.</td></tr>
+<tr><td>Oracle changes after delivery</td><td>Caught by the settle watch soon after delivery, then by the snapshot or daily audit.</td></tr>
 </tbody>
 </table>
 
@@ -210,9 +217,12 @@
 <tr><td><strong>Cost follows the order, not the table</strong></td><td>Each read covers one order, so this path doesn't slow down as data grows.</td></tr>
 <tr><td><strong>One simple, repeatable core</strong></td><td>Retries, restarts, late changes and verification all go through one comparison, and repeating it is always safe.</td></tr>
 <tr><td><strong>Every order has an answer</strong></td><td>Each ends with a known status and reason, overdue orders raise an event, and <code>make explain</code> answers from live data with no manual check in Oracle.</td></tr>
-<tr><td><strong>Delivered means checked</strong></td><td>The status is set only when a pass finds both systems match, and the settle watch checks once more.</td></tr>
+<tr><td><strong>Delivered means the warehouse can see it</strong></td><td>The status is set only when a pass finds the lines and the fulfillment order match, and the settle watch checks once more.</td></tr>
+<tr><td><strong>Stays correct after delivery</strong></td><td>A low-priority daily audit corrects drift, so a mistake doesn't wait for someone to notice it.</td></tr>
+<tr><td><strong>Real numbers from the first DEV run</strong></td><td>Every order records Oracle's wait and approve to visible, which answers the biggest unknown and shows the improvement.</td></tr>
 <tr><td><strong>Customer data stays out of Temporal</strong></td><td>History holds keys, quantities and counts, so no Payload Codec is needed for this and large orders can't hit payload limits.</td></tr>
 <tr><td><strong>Survives failures</strong></td><td>Worker restarts, lost responses, Foundry outages and expired credentials pause the work rather than lose it.</td></tr>
+<tr><td><strong>Operators can act</strong></td><td>One command retries an order, and one signals all overdue orders after an outage.</td></tr>
 <tr><td><strong>Ready for Oracle events</strong></td><td>If Oracle's events cover this status, they cut the wait with no redesign, and polling remains the fallback.</td></tr>
 <tr><td><strong>Low-risk rollout</strong></td><td>One flag returns the app to today's behaviour, the sweep is optional, and the snapshot remains the safety net.</td></tr>
 </tbody>
@@ -224,14 +234,15 @@
 <tr><td><strong>Not run on real systems</strong></td><td>Adapters, Foundry actions and all timings are still assumptions.</td><td>Implement the adapters on the client's DEV environment</td></tr>
 <tr><td><strong>Oracle time is the floor, and unknown</strong></td><td>The workflow can't read lines Oracle hasn't created, so no latency can be promised yet.</td><td>Measure each step on DEV</td></tr>
 <tr><td><strong>Two writers to the same data</strong></td><td>Foundry compares the edit's time with Oracle's UTC timestamp, so a clock difference could hide a change from the snapshot. The settle watch catches this only soon after delivery. These rules come from Foundry's documentation and aren't tested on a real tenant.</td><td>Confirm timestamp type and clock difference, and test on DEV</td></tr>
-<tr><td><strong>Rows deleted after the workflow ends</strong></td><td>Foundry keeps an object an Action created when its source row disappears, so it stays until something removes it.</td><td>Learn whether Oracle deletes or only cancels shipment lines</td></tr>
-<tr><td><strong>More Oracle reads per order</strong></td><td>Each pass makes at least two Oracle calls. The limit counts activities, not HTTP calls, the app or the connector. A stricter limit also adds delay: 1 activity per second is part of the 8.9 seconds above.</td><td>Get the real limit, then tune the rate and polling</td></tr>
+<tr><td><strong>The fulfillment object is our model</strong></td><td>Lines and fulfillment orders are written and verified, but the real object's name, keys and fields are unconfirmed, and they must match the client's transform.</td><td>Get them from the client, then adjust one function and the adapter</td></tr>
+<tr><td><strong>Rows deleted after the workflow ends</strong></td><td>Foundry keeps an object an Action created when its source row disappears. The audit removes it, but only for orders inside its lookback.</td><td>Learn whether Oracle deletes or only cancels shipment lines</td></tr>
+<tr><td><strong>More Oracle reads per order</strong></td><td>Each pass makes at least two Oracle calls, and the audit adds more. The limit counts activities, not HTTP calls, the app or the connector. A stricter limit also adds delay: 1 activity per second is part of the time above.</td><td>Get the real limit, then tune the rate and polling</td></tr>
 <tr><td><strong>New parts to run</strong></td><td>Temporal and workers need operating, and the team needs to learn them.</td><td>Start on EC2 or Temporal Cloud at low volume</td></tr>
 <tr><td><strong>Integration work</strong></td><td>The client implements two adapters with six methods, creates three Foundry actions, and adds a service identity. A per-row version check may need a function-backed action.</td><td>Use the simulators as a reference, and skip the sweep at first</td></tr>
 <tr><td><strong>Alerts need a destination</strong></td><td>Overdue and ActionRequired events can post to a webhook, but no channel is chosen yet.</td><td>Choose one with the client</td></tr>
-<tr><td><strong>Oracle events aren't connected</strong></td><td>The Signal path is built and tested, but nobody has confirmed which Oracle status means shipment lines exist.</td><td>Confirm with the client, or keep polling</td></tr>
+<tr><td><strong>Oracle events aren't connected</strong></td><td>The check-now path is built and tested, but nobody has confirmed which Oracle status means shipment lines exist.</td><td>Confirm with the client, or keep polling</td></tr>
 <tr><td><strong>Holds aren't recognised</strong></td><td>An order on hold polls until the deadline, then shows ActionRequired.</td><td>Learn how holds appear in Oracle</td></tr>
-<tr><td><strong>Not production hardened</strong></td><td>No workflow versioning yet, and the worker bundles its code at startup. History lasts 30–90 days unless exported through the event sink.</td><td>Add versioning and a prebuilt bundle before the first release</td></tr>
+<tr><td><strong>Not production hardened</strong></td><td>No workflow versioning yet, and the worker bundles its code at startup. Priority's effect under real backlog isn't measured. History lasts 30–90 days unless exported through the event sink.</td><td>Add versioning and a prebuilt bundle before the first release</td></tr>
 </tbody>
 </table>
 </body>
