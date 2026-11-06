@@ -1,0 +1,11 @@
+{
+  "name": "@shift4/worker",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "dependencies": {
+    "@shift4/order-delivery": "workspace:*",
+    "@temporalio/client": "1.25.0",
+    "@temporalio/worker": "1.25.0"
+  }
+}
