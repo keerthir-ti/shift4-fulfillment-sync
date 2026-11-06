@@ -1,0 +1,66 @@
+:root {
+  color: #1c1915;
+  background: #efe7d6;
+  font-family: "Avenir Next", "Segoe UI", sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body { margin: 0; }
+
+main { max-width: 1100px; margin: 0 auto; padding: 28px 20px 48px; }
+
+.top, .panel-head, .controls, .rows li, .meters { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+
+.eyebrow { margin: 0; letter-spacing: 0.08em; text-transform: uppercase; font-size: 12px; color: #7c5a2a; }
+
+h1 { margin: 4px 0 0; font-family: "Iowan Old Style", Palatino, serif; font-size: 40px; font-weight: 600; }
+
+h2 { margin: 0; font-size: 18px; }
+
+.message, .note { color: #5c5146; }
+
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+.panel { background: #fffaf2; border: 1px solid #ddc9a4; border-radius: 16px; padding: 16px; }
+
+.lab { margin-top: 16px; }
+
+form, .rows, .timeline { display: grid; gap: 8px; }
+
+label { display: grid; gap: 4px; font-size: 13px; }
+
+input, button { font: inherit; }
+
+input { border: 1px solid #ddc9a4; background: white; border-radius: 8px; padding: 8px 10px; }
+
+button { border: 0; background: #1f3d34; color: #f6f1e6; border-radius: 999px; padding: 8px 14px; cursor: pointer; }
+
+button:disabled { opacity: 0.6; }
+
+.rows { list-style: none; padding: 0; margin: 16px 0 0; }
+
+.rows li, .meters div { background: #f6efe2; border-radius: 12px; padding: 10px 12px; }
+
+.rows div { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+
+.empty { color: #6d6256; }
+
+.tag { font-size: 12px; border: 1px solid #ddc9a4; border-radius: 999px; padding: 4px 8px; }
+
+.gap { background: #9a3412; color: white; padding: 12px 14px; border-radius: 12px; }
+
+.meters { display: grid; grid-template-columns: repeat(4, 1fr); margin: 12px 0; }
+
+.meters span, .timeline span, .timeline em { color: #6d6256; font-size: 12px; }
+
+.timeline { list-style: none; padding: 0; margin: 0; }
+
+.timeline li { display: grid; grid-template-columns: 90px 1fr auto; gap: 8px; font-family: ui-monospace, monospace; font-size: 12px; }
+
+.unknown { color: #9a3412; }
+
+@media (max-width: 800px) {
+  .grid, .meters { grid-template-columns: 1fr; }
+  .top { display: grid; }
+}
