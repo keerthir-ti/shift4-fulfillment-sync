@@ -1,0 +1,10 @@
+{
+  "name": "@shift4/contracts",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "exports": {
+    ".": "./src/index.ts",
+    "./fixture": "./src/fixture.ts"
+  }
+}

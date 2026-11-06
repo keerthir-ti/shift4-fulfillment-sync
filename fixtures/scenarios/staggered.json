@@ -1,0 +1,13 @@
+{
+  "products": [
+    {
+      "productNumber": "POS-SPLIT",
+      "name": "Split accessory",
+      "stocked": true,
+      "splits": [
+        { "quantity": 1, "readyOffsetMs": 5000 },
+        { "quantity": 3, "readyOffsetMs": 9000 }
+      ]
+    }
+  ]
+}

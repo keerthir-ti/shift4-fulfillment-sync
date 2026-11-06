@@ -1,0 +1,14 @@
+{
+  "scenarioId": "baseline",
+  "resourceVersion": "11.13.18.05",
+  "businessUnit": "Merchant 360",
+  "customers": [{ "name": "Synthetic Merchant Ltd" }],
+  "organizations": [{ "code": "WH-DUB", "name": "County Dublin" }],
+  "items": [
+    { "productNumber": "POS-ACC", "name": "POS accessory", "stocked": true },
+    { "productNumber": "POS-EMPTY", "name": "Unstocked accessory", "stocked": false }
+  ],
+  "lineQuantity": 2,
+  "expectedShipmentId": "4001",
+  "expectedShipmentQuantity": 2
+}
